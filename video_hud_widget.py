@@ -1,10 +1,10 @@
 """
 video_hud_widget.py - Real Dashcam Video View with Minimalist Augmented Reality (AR) HUD.
 Renders clean tactical corner brackets, 3D wireframe boxes, drivable road carpet,
-and pedestrian/vehicle distance badges.
+pedestrian/vehicle distance badges, and interactive hover synchronization.
 """
 
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -19,7 +19,8 @@ FRENCH_CLASSES = {
     'bicycle': 'Vélo',
     'motorcycle': 'Moto',
     'bus': 'Bus',
-    'truck': 'Camion'
+    'truck': 'Camion',
+    'default': 'Cible'
 }
 
 
@@ -28,6 +29,9 @@ class VideoHUDWidget(QtWidgets.QWidget):
     High-performance QWidget displaying camera video stream with a sleek,
     minimalist HUD overlay (Tesla / Mobileye inspired).
     """
+
+    actor_hovered = QtCore.Signal(object)  # Emits int track_id or None
+    actor_selected = QtCore.Signal(object) # Emits int track_id or None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -48,6 +52,15 @@ class VideoHUDWidget(QtWidgets.QWidget):
         self.current_result: Optional[PerceptionResult] = None
         self.geom: Optional[BEVGeometry] = None
 
+        # Interactive state
+        self.hovered_track_id: Optional[int] = None
+        self.selected_track_id: Optional[int] = None
+
+        # Box screen mappings: track_id -> [sx1, sy1, sx2, sy2]
+        self._screen_boxes: Dict[int, List[float]] = {}
+
+        self.setMouseTracking(True)
+
     def update_frame(self, frame: np.ndarray, result: PerceptionResult, geom: BEVGeometry):
         self.current_frame = frame
         self.current_result = result
@@ -55,9 +68,40 @@ class VideoHUDWidget(QtWidgets.QWidget):
         self.update()
 
     def set_box_mode(self, mode: str):
-        if mode in ("2D_BRACKETS", "3D_CUBOID"):
+        if mode in ("2D_BRACKETS", "3D_CUBOID", "OFF"):
             self.box_mode = mode
+            self.show_boxes = (mode != "OFF")
             self.update()
+
+    def set_highlighted_actor(self, track_id: Optional[int]):
+        """Highlights box when hovered on the 3D BEV screen."""
+        if self.hovered_track_id != track_id:
+            self.hovered_track_id = track_id
+            self.update()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
+        pos = event.pos()
+        hovered = self._find_actor_at(pos.x(), pos.y())
+        if hovered != self.hovered_track_id:
+            self.hovered_track_id = hovered
+            self.actor_hovered.emit(hovered)
+            self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() in (QtCore.Qt.LeftButton, QtCore.Qt.RightButton):
+            pos = event.pos()
+            clicked = self._find_actor_at(pos.x(), pos.y())
+            if clicked is not None:
+                self.selected_track_id = clicked
+                self.actor_selected.emit(clicked)
+                self.update()
+
+    def _find_actor_at(self, px: float, py: float) -> Optional[int]:
+        """Finds track ID whose 2D screen box contains (px, py)."""
+        for t_id, box in self._screen_boxes.items():
+            if box[0] <= px <= box[2] and box[1] <= py <= box[3]:
+                return t_id
+        return None
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         painter = QtGui.QPainter(self)
@@ -66,6 +110,7 @@ class VideoHUDWidget(QtWidgets.QWidget):
 
         w_widget = self.width()
         h_widget = self.height()
+        self._screen_boxes.clear()
 
         if self.current_frame is None:
             painter.fillRect(0, 0, w_widget, h_widget, QtGui.QColor("#080b0f"))
@@ -85,173 +130,192 @@ class VideoHUDWidget(QtWidgets.QWidget):
 
         display_img = frame.copy()
 
-        # 1. Tapis de route (Emerald tint subtil et transparent)
+        # 1. Drivable Road Carpet Overlay
         if self.show_drivable_carpet and self.current_result is not None:
             da_mask = self.current_result.drivable_mask
             if da_mask is not None and da_mask.max() > 0:
                 overlay = display_img.copy()
-                overlay[da_mask > 0] = [170, 225, 50]
+                overlay[da_mask > 0] = [170, 225, 50] # Glowing cyan-green
                 cv2.addWeighted(overlay, 0.22, display_img, 0.78, 0, display_img)
 
-        # 2. Lignes de voies (Bleu cyan subtil)
+        # 2. Lane Lines Overlay
         if self.show_lane_lines and self.current_result is not None:
             lane_mask = self.current_result.lane_mask
             if lane_mask is not None and lane_mask.max() > 0:
-                display_img[lane_mask > 0] = [255, 230, 0]
+                display_img[lane_mask > 0] = [255, 230, 0] # Electric yellow/cyan
 
-        # 3. Passages piétons
-        if self.show_crosswalks and self.current_result is not None:
-            for cw in self.current_result.crosswalks:
-                x1, y1, x2, y2 = cw['box']
-                cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 200, 255), 2)
+        # Convert to QImage and draw
+        display_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+        qimg = QtGui.QImage(
+            display_rgb.data,
+            fw,
+            fh,
+            fw * 3,
+            QtGui.QImage.Format_RGB888
+        )
+        target_rect = QtCore.QRect(dx, dy, dw, dh)
+        painter.drawImage(target_rect, qimg)
 
-        # Dessin de l'image
-        rgb_img = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
-        bytes_per_line = 3 * fw
-        qimg = QtGui.QImage(rgb_img.data, fw, fh, bytes_per_line, QtGui.QImage.Format_RGB888)
-        dest_rect = QtCore.QRect(dx, dy, dw, dh)
-        painter.drawImage(dest_rect, qimg)
+        # Coordinate transform from frame pixels to widget coordinates:
+        def to_widget(x: float, y: float) -> Tuple[float, float]:
+            return dx + x * scale, dy + y * scale
 
-        def to_screen(u, v):
-            return dx + int(u * scale), dy + int(v * scale)
+        # 3. Horizon line (if enabled)
+        if self.show_horizon and self.current_result is not None:
+            _, hy = to_widget(0, self.current_result.horizon_y)
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 230, 255, 90), 1.0, QtCore.Qt.DashLine))
+            painter.drawLine(QtCore.QPointF(dx, hy), QtCore.QPointF(dx + dw, hy))
 
-        # 4. Boîtes de détection épurées (2D Brackets ou 3D)
+        # 4. Trajectory Corridor Road Projection
+        if self.current_result and self.geom:
+            self._draw_road_trajectory_corridor(painter, to_widget)
+
+        # 5. Actors Bounding Boxes & Distance Badges
         if self.show_boxes and self.current_result is not None:
             for trk in self.current_result.tracks:
-                class_label = FRENCH_CLASSES.get(trk.class_name, trk.class_name.capitalize())
+                self._draw_actor_hud(painter, trk, to_widget)
 
-                # Palette de couleurs minimaliste
-                if trk.warning_level == 'critical':
-                    accent_color = QtGui.QColor(255, 42, 60) # Rouge alerte
-                    fill_color = QtGui.QColor(255, 42, 60, 40)
-                elif trk.class_name == 'person':
-                    accent_color = QtGui.QColor(255, 65, 120) # Rose corail
-                    fill_color = QtGui.QColor(255, 65, 120, 30)
-                elif trk.class_name in ('bicycle', 'motorcycle'):
-                    accent_color = QtGui.QColor(255, 185, 20) # Ambre
-                    fill_color = QtGui.QColor(255, 185, 20, 30)
-                else:
-                    accent_color = QtGui.QColor(0, 230, 255) # Cyan électrique
-                    fill_color = QtGui.QColor(0, 230, 255, 25)
+        # 6. Forward Collision Warning Flash Banner
+        if self.current_result and self.current_result.fcw_alert:
+            self._draw_fcw_alert(painter, dx, dy, dw, dh)
 
-                if self.box_mode == "3D_CUBOID" and self.geom is not None:
-                    # Rendu 3D Cuboïde filaire épuré
-                    pts_2d = self.geom.project_3d_box(trk.corners_3d)
-                    if pts_2d is not None and len(pts_2d) == 8:
-                        screen_pts = [to_screen(u, v) for u, v in pts_2d]
-                        pen = QtGui.QPen(accent_color, 1.6)
-                        painter.setPen(pen)
+    def _draw_road_trajectory_corridor(self, painter: QtGui.QPainter, to_widget):
+        """Draws projected trajectory corridor onto the 2D video road."""
+        corridor = self.current_result.trajectory_corridor
+        if len(corridor) < 2 or self.geom is None:
+            return
 
-                        for (i, j) in [(0, 1), (1, 2), (2, 3), (3, 0),
-                                      (4, 5), (5, 6), (6, 7), (7, 4),
-                                      (0, 4), (1, 5), (2, 6), (3, 7)]:
-                            painter.drawLine(QtCore.QPoint(*screen_pts[i]), QtCore.QPoint(*screen_pts[j]))
+        hw = 1.05
+        left_screen = []
+        right_screen = []
 
-                        top_u = (screen_pts[4][0] + screen_pts[5][0]) / 2.0
-                        top_v = min(screen_pts[4][1], screen_pts[5][1])
-                        self._draw_label_pill(painter, top_u, top_v - 8, class_label, trk.Z, trk.ttc, accent_color)
-                        continue
+        for x, z in corridor:
+            u_l, v_l = self.geom.world_to_image(x - hw, 0.0, z)
+            u_r, v_r = self.geom.world_to_image(x + hw, 0.0, z)
+            if u_l is not None and v_l is not None:
+                sx, sy = to_widget(u_l, v_l)
+                left_screen.append(QtCore.QPointF(sx, sy))
+            if u_r is not None and v_r is not None:
+                sx, sy = to_widget(u_r, v_r)
+                right_screen.append(QtCore.QPointF(sx, sy))
 
-                # Rendu 2D Viseur / Tactical Brackets (Par défaut, ultra-épuré)
-                bx1, by1, bx2, by2 = trk.box_2d
-                sx1, sy1 = to_screen(bx1, by1)
-                sx2, sy2 = to_screen(bx2, by2)
-                bw = sx2 - sx1
-                bh = sy2 - sy1
+        if len(left_screen) >= 2 and len(right_screen) >= 2:
+            poly = QtGui.QPolygonF(left_screen + list(reversed(right_screen)))
+            is_fcw = self.current_result.fcw_alert
+            fill = QtGui.QColor(239, 68, 68, 50) if is_fcw else QtGui.QColor(0, 230, 255, 30)
+            edge = QtGui.QColor(239, 68, 68, 190) if is_fcw else QtGui.QColor(0, 230, 255, 120)
+            painter.setPen(QtGui.QPen(edge, 1.5))
+            painter.setBrush(QtGui.QBrush(fill))
+            painter.drawPolygon(poly)
 
-                if bw > 8 and bh > 8:
-                    # Remplissage très subtil
-                    painter.fillRect(QtCore.QRect(sx1, sy1, bw, bh), QtGui.QBrush(fill_color))
+    def _draw_actor_hud(self, painter: QtGui.QPainter, trk, to_widget):
+        """Draws tactical corner brackets and dark glass info badge for an actor."""
+        x1, y1, x2, y2 = trk.box_2d
+        sx1, sy1 = to_widget(x1, y1)
+        sx2, sy2 = to_widget(x2, y2)
+        bw = sx2 - sx1
+        bh = sy2 - sy1
 
-                    # 4 coins en L fins
-                    c_len = min(14, max(5, bw // 4), max(5, bh // 4))
-                    pen = QtGui.QPen(accent_color, 2.0, QtCore.Qt.SolidLine, QtCore.Qt.SquareCap)
-                    painter.setPen(pen)
+        # Store screen hit-box
+        self._screen_boxes[trk.track_id] = [sx1, sy1, sx2, sy2]
 
-                    # Haut-gauche
-                    painter.drawLine(sx1, sy1, sx1 + c_len, sy1)
-                    painter.drawLine(sx1, sy1, sx1, sy1 + c_len)
+        is_hovered = (trk.track_id == self.hovered_track_id)
+        is_lead = (self.current_result and self.current_result.lead_vehicle and self.current_result.lead_vehicle.track_id == trk.track_id)
 
-                    # Haut-droite
-                    painter.drawLine(sx2, sy1, sx2 - c_len, sy1)
-                    painter.drawLine(sx2, sy1, sx2, sy1 + c_len)
+        # Color palette
+        if trk.warning_level == 'critical':
+            color = QtGui.QColor(239, 68, 68)  # Crimson
+        elif is_lead:
+            color = QtGui.QColor(245, 158, 11) # Amber Gold
+        elif is_hovered:
+            color = QtGui.QColor(0, 245, 255)  # Electric Cyan
+        elif trk.class_name == 'person':
+            color = QtGui.QColor(255, 90, 130) # Coral
+        else:
+            color = QtGui.QColor(56, 189, 248)  # Sky Blue
 
-                    # Bas-gauche
-                    painter.drawLine(sx1, sy2, sx1 + c_len, sy2)
-                    painter.drawLine(sx1, sy2, sx1, sy2 - c_len)
+        line_w = 2.4 if (is_hovered or is_lead) else 1.8
+        pen = QtGui.QPen(color, line_w)
+        painter.setPen(pen)
 
-                    # Bas-droite
-                    painter.drawLine(sx2, sy2, sx2 - c_len, sy2)
-                    painter.drawLine(sx2, sy2, sx2, sy2 - c_len)
+        if self.box_mode == "2D_BRACKETS":
+            # Tactical viseur corner brackets
+            k = min(12.0, bw * 0.28, bh * 0.28)
+            # Top-left
+            painter.drawLine(QtCore.QPointF(sx1, sy1 + k), QtCore.QPointF(sx1, sy1))
+            painter.drawLine(QtCore.QPointF(sx1, sy1), QtCore.QPointF(sx1 + k, sy1))
+            # Top-right
+            painter.drawLine(QtCore.QPointF(sx2 - k, sy1), QtCore.QPointF(sx2, sy1))
+            painter.drawLine(QtCore.QPointF(sx2, sy1), QtCore.QPointF(sx2, sy1 + k))
+            # Bottom-left
+            painter.drawLine(QtCore.QPointF(sx1, sy2 - k), QtCore.QPointF(sx1, sy2))
+            painter.drawLine(QtCore.QPointF(sx1, sy2), QtCore.QPointF(sx1 + k, sy2))
+            # Bottom-right
+            painter.drawLine(QtCore.QPointF(sx2 - k, sy2), QtCore.QPointF(sx2, sy2))
+            painter.drawLine(QtCore.QPointF(sx2, sy2), QtCore.QPointF(sx2, sy2 - k))
 
-                    # Petite étiquette discrète au-dessus
-                    mid_u = (sx1 + sx2) / 2.0
-                    self._draw_label_pill(painter, mid_u, sy1 - 6, class_label, trk.Z, trk.ttc, accent_color)
-
-        # 5. Horizon subtil si activé
-        if self.show_horizon and self.current_result is not None:
-            hy = self.current_result.horizon_y
-            _, shy = to_screen(0, hy)
-            if dy <= shy <= dy + dh:
-                pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 40), 1.0, QtCore.Qt.DashLine)
+            # Subtle glow if hovered or lead
+            if is_hovered or is_lead:
+                glow_pen = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 50), 4.0)
+                painter.setPen(glow_pen)
+                painter.drawRect(QtCore.QRectF(sx1, sy1, bw, bh))
                 painter.setPen(pen)
-                painter.drawLine(dx, shy, dx + dw, shy)
 
-        # 6. Alerte anticollision si active
-        if self.current_result is not None and self.current_result.fcw_alert:
-            self._draw_alert_banner(painter, dx, dy, dw, "⚠️ RISQUE DE COLLISION IMMINENT", QtGui.QColor(230, 30, 50))
-        elif self.current_result is not None and self.current_result.pedestrian_alert:
-            self._draw_alert_banner(painter, dx, dy, dw, "⚠️ ATTENTION PIÉTON SUR LA VOIE", QtGui.QColor(255, 120, 20))
+        elif self.box_mode == "3D_CUBOID" and self.geom:
+            # 3D projected cuboid
+            corners_3d = self.geom.get_3d_box_corners(trk.X, trk.Z, trk.class_name, yaw=trk.yaw)
+            pts_2d = self.geom.project_3d_box(corners_3d)
+            if pts_2d:
+                screen_pts = [to_widget(u, v) for u, v in pts_2d]
+                self._draw_wireframe_cuboid(painter, screen_pts, color)
+            else:
+                painter.drawRect(QtCore.QRectF(sx1, sy1, bw, bh))
 
-    def _draw_label_pill(
-        self,
-        painter: QtGui.QPainter,
-        center_x: float,
-        top_y: float,
-        label: str,
-        dist_z: float,
-        ttc: Optional[float],
-        accent_color: QtGui.QColor
-    ):
-        """Dessine une étiquette discrète et élégante (ex: 'Piéton 4.2m')."""
-        text = f"{label} {dist_z:.1f}m"
-        if ttc is not None and ttc < 3.0:
-            text += f" • {ttc:.1f}s"
+        # Bottom distance tag capsule
+        fr_name = FRENCH_CLASSES.get(trk.class_name, trk.class_name.capitalize())
+        if is_lead:
+            tag_text = f"★ LEAD #{trk.track_id} • {trk.Z:.1f}m"
+        else:
+            tag_text = f"#{trk.track_id} {fr_name} • {trk.Z:.1f}m"
 
-        painter.setFont(QtGui.QFont("SF Pro Display", 8, QtGui.QFont.DemiBold))
-        fm = painter.fontMetrics()
-        pw = fm.horizontalAdvance(text) + 10
-        ph = fm.height() + 2
+        font = QtGui.QFont("SF Pro Display", 9, QtGui.QFont.Bold)
+        painter.setFont(font)
+        fm = QtGui.QFontMetrics(font)
+        tw = fm.horizontalAdvance(tag_text)
+        th = fm.height()
 
-        px = int(center_x - pw / 2.0)
-        py = int(top_y - ph)
+        tag_x = sx1 + (bw - tw) / 2.0 - 5
+        tag_y = sy2 + 3
+        tag_w = tw + 10
+        tag_h = th + 2
 
-        # Fond sombre discret
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor(10, 14, 20, 210)))
-        painter.drawRoundedRect(px, py, pw, ph, 3, 3)
+        painter.setPen(QtGui.QPen(color, 1.0))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(10, 15, 24, 220)))
+        painter.drawRoundedRect(QtCore.QRectF(tag_x, tag_y, tag_w, tag_h), 3.0, 3.0)
 
-        # Bordure fine
-        painter.setPen(QtGui.QPen(accent_color, 1.0))
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.drawRoundedRect(px, py, pw, ph, 3, 3)
+        painter.setPen(QtGui.QColor("#ffffff"))
+        painter.drawText(int(tag_x + 5), int(tag_y + th - 2), tag_text)
 
-        # Texte
-        painter.setPen(QtGui.QColor(240, 245, 250))
-        painter.drawText(QtCore.QRect(px, py, pw, ph), QtCore.Qt.AlignCenter, text)
+    def _draw_wireframe_cuboid(self, painter: QtGui.QPainter, pts: List[Tuple[float, float]], color: QtGui.QColor):
+        """Draws 12 edges of a 3D bounding box."""
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0), # Bottom face
+            (4, 5), (5, 6), (6, 7), (7, 4), # Top face
+            (0, 4), (1, 5), (2, 6), (3, 7)  # Vertical pillars
+        ]
+        for i1, i2 in edges:
+            p1 = QtCore.QPointF(pts[i1][0], pts[i1][1])
+            p2 = QtCore.QPointF(pts[i2][0], pts[i2][1])
+            painter.drawLine(p1, p2)
 
-    def _draw_alert_banner(self, painter: QtGui.QPainter, x: int, y: int, w: int, text: str, color: QtGui.QColor):
-        bh = 32
-        bw = min(360, w - 40)
-        bx = x + (w - bw) // 2
-        by = y + 14
+    def _draw_fcw_alert(self, painter: QtGui.QPainter, dx: int, dy: int, dw: int, dh: int):
+        """Draws a pulsing collision warning banner."""
+        banner_h = 32
+        rect = QtCore.QRect(dx + 20, dy + 15, dw - 40, banner_h)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#ff2a3c"), 1.5))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(239, 68, 68, 200)))
+        painter.drawRoundedRect(rect, 6, 6)
 
-        painter.setPen(QtCore.Qt.NoPen)
-        bg = QtGui.QColor(color)
-        bg.setAlpha(200)
-        painter.setBrush(QtGui.QBrush(bg))
-        painter.drawRoundedRect(bx, by, bw, bh, 5, 5)
-
-        painter.setFont(QtGui.QFont("SF Pro Display", 10, QtGui.QFont.Bold))
-        painter.setPen(QtGui.QColor(255, 255, 255))
-        painter.drawText(QtCore.QRect(bx, by, bw, bh), QtCore.Qt.AlignCenter, text)
+        painter.setPen(QtGui.QColor("#ffffff"))
+        painter.setFont(QtGui.QFont("SF Pro Display", 11, QtGui.QFont.Bold))
+        painter.drawText(rect, QtCore.Qt.AlignCenter, "⚠️ ALERTE RISQUE DE COLLISION IMMINENTE")

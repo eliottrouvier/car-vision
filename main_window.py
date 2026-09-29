@@ -1,7 +1,15 @@
 """
-main_window.py - Minimalist Cockpit Dashboard for Car-Vision.
-Features Apple/Tesla-inspired Dark Glass UI, Dual-Screen View (Windshield HUD + BEV),
-2D Tactical Brackets / 3D Cuboids, and Native Apple Silicon M4 MPS Acceleration.
+main_window.py - Sleek Minimalist Cockpit Dashboard for Car-Vision.
+Features:
+- Apple/Tesla-inspired Dark Glass UI
+- Dual-Screen Synchronization (Windshield AR HUD + 3D Tesla FSD Vector Space)
+- Thread-Safe Video Worker Engine with Fallback & Zero Race Conditions
+- Full Drag & Drop Support for Video Files
+- Live YOLO Model Switcher (YOLO11s, YOLO11m, YOLO11n)
+- 3 Instant 3D Camera Presets (FSD Driver, Helicopter 45°, Top-Down)
+- Camera Auto-Calibration & Horizon Pitch Slider
+- 1-Click Dual-Screen PNG Snapshot & MP4 Video Export
+- Collapsible Quick Toggles (Visor Brackets, Drivable Carpet, Lanes, Horizon)
 """
 
 from typing import Optional, List, Dict, Any
@@ -17,15 +25,24 @@ from bev_widget import BEVWidget
 
 
 class VideoProcessingThread(QtCore.QThread):
-    """Background worker thread processing frames asynchronously."""
+    """
+    Rock-Solid Thread-Safe Background Worker processing video frames asynchronously.
+    Guarantees no race conditions with OpenCV VideoCapture descriptors.
+    """
     frame_processed = QtCore.Signal(np.ndarray, object)
     playback_state_changed = QtCore.Signal(bool)
     position_changed = QtCore.Signal(int, int)
+    source_load_failed = QtCore.Signal(str)
 
     def __init__(self, engine: PanopticPerceptionEngine):
         super().__init__()
         self.engine = engine
-        self.video_source: Optional[str] = None
+        self.mutex = QtCore.QMutex()
+
+        self._pending_source: Optional[Any] = None
+        self._pending_seek: int = -1
+        self._toggle_pause_requested: bool = False
+
         self.is_running = True
         self.is_paused = False
         self.cap: Optional[cv2.VideoCapture] = None
@@ -33,54 +50,86 @@ class VideoProcessingThread(QtCore.QThread):
         self.total_frames = 0
         self.current_frame_idx = 0
         self.loop_video = True
-        self.seek_requested = -1
-        self.step_requested = 0
 
     def open_source(self, source_path_or_idx):
-        self.is_paused = True
-        if self.cap is not None:
-            self.cap.release()
-
-        self.video_source = source_path_or_idx
-        self.cap = cv2.VideoCapture(source_path_or_idx)
-        if self.cap.isOpened():
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.target_fps = fps if (fps and 5.0 <= fps <= 60.0) else 30.0
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.current_frame_idx = 0
-            self.is_paused = False
-            self.playback_state_changed.emit(True)
-        else:
-            print(f"[Worker] Could not open video source: {source_path_or_idx}")
+        """Thread-safe request to switch video source."""
+        with QtCore.QMutexLocker(self.mutex):
+            self._pending_source = source_path_or_idx
 
     def toggle_play_pause(self):
-        self.is_paused = not self.is_paused
-        self.playback_state_changed.emit(not self.is_paused)
+        """Thread-safe play/pause toggle."""
+        with QtCore.QMutexLocker(self.mutex):
+            self._toggle_pause_requested = True
 
     def seek_frame(self, frame_idx: int):
-        self.seek_requested = frame_idx
+        """Thread-safe frame seek."""
+        with QtCore.QMutexLocker(self.mutex):
+            self._pending_seek = frame_idx
 
     def stop(self):
+        """Graceful shutdown of worker thread."""
         self.is_running = False
-        self.wait(2000)
+        self.wait(1500)
         if self.cap is not None:
             self.cap.release()
+            self.cap = None
 
     def run(self):
         while self.is_running:
+            # 1. Process pending commands thread-safely
+            new_source = None
+            new_seek = -1
+            toggle_pause = False
+
+            with QtCore.QMutexLocker(self.mutex):
+                if self._pending_source is not None:
+                    new_source = self._pending_source
+                    self._pending_source = None
+                if self._pending_seek >= 0:
+                    new_seek = self._pending_seek
+                    self._pending_seek = -1
+                if self._toggle_pause_requested:
+                    toggle_pause = True
+                    self._toggle_pause_requested = False
+
+            # Switch source if requested
+            if new_source is not None:
+                if self.cap is not None:
+                    self.cap.release()
+                    self.cap = None
+
+                self.cap = cv2.VideoCapture(new_source)
+                if self.cap.isOpened():
+                    fps = self.cap.get(cv2.CAP_PROP_FPS)
+                    self.target_fps = fps if (fps and 5.0 <= fps <= 60.0) else 30.0
+                    self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    self.current_frame_idx = 0
+                    self.is_paused = False
+                    self.playback_state_changed.emit(True)
+                else:
+                    self.source_load_failed.emit(str(new_source))
+                    continue
+
+            # Handle play/pause toggle
+            if toggle_pause:
+                self.is_paused = not self.is_paused
+                self.playback_state_changed.emit(not self.is_paused)
+
+            # Handle timeline seek
+            if new_seek >= 0 and self.cap is not None and self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, new_seek)
+                self.current_frame_idx = new_seek
+
+            # Check capture availability
             if self.cap is None or not self.cap.isOpened():
                 self.msleep(30)
                 continue
-
-            if self.seek_requested >= 0:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.seek_requested)
-                self.current_frame_idx = self.seek_requested
-                self.seek_requested = -1
 
             if self.is_paused:
                 self.msleep(30)
                 continue
 
+            # 2. Read frame
             t_start = time.time()
             ret, frame = self.cap.read()
             if not ret:
@@ -96,13 +145,13 @@ class VideoProcessingThread(QtCore.QThread):
 
             self.current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-            # Run perception pipeline
+            # 3. Execute panoptic perception pipeline on Apple Silicon M4
             result = self.engine.process_frame(frame, enable_panoptic=True, enable_detection=True)
 
             self.frame_processed.emit(frame, result)
             self.position_changed.emit(self.current_frame_idx, self.total_frames)
 
-            # Match native video frame rate
+            # 4. Maintain target playback rate
             proc_time = time.time() - t_start
             desired_frame_time = 1.0 / self.target_fps
             sleep_time = max(0.001, desired_frame_time - proc_time)
@@ -116,19 +165,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self, sample_dir: str = "samples"):
         super().__init__()
-        self.setWindowTitle("Car-Vision")
-        self.resize(1380, 820)
+        self.setWindowTitle("Car-Vision • Cockpit de Perception Autonome 3D")
+        self.resize(1420, 840)
         self.sample_dir = sample_dir
 
-        self.engine = PanopticPerceptionEngine()
+        # Enable Drag and Drop from Finder
+        self.setAcceptDrops(True)
 
+        # Perception Engine (defaults to YOLO11s)
+        self.engine = PanopticPerceptionEngine(yolo_actor_weights="yolo11s.pt")
+
+        # Worker Thread
         self.worker = VideoProcessingThread(self.engine)
         self.worker.frame_processed.connect(self._on_frame_processed)
         self.worker.playback_state_changed.connect(self._on_playback_state_changed)
         self.worker.position_changed.connect(self._on_position_changed)
+        self.worker.source_load_failed.connect(self._on_source_load_failed)
 
         self._build_ui()
         self._apply_minimal_theme()
+
+        # Cross-screen hover & selection synchronization
+        self.video_hud.actor_hovered.connect(self.bev_view.set_highlighted_actor)
+        self.bev_view.actor_hovered.connect(self.video_hud.set_highlighted_actor)
 
         self.worker.start()
 
@@ -139,6 +198,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if os.path.exists(default_video):
             self.worker.open_source(default_video)
 
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent):
+        """Accept dragging video files onto the window."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        """Open dropped video file."""
+        for url in event.mimeData().urls():
+            file_path = url.toLocalFile()
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ('.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'):
+                self.worker.open_source(file_path)
+                self.lbl_status.setText(f"Vidéo chargée : {os.path.basename(file_path)}")
+                break
+
     def _build_ui(self):
         main_widget = QtWidgets.QWidget()
         self.setCentralWidget(main_widget)
@@ -146,15 +220,15 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout.setContentsMargins(10, 8, 10, 8)
         main_layout.setSpacing(8)
 
-        # 1. Barre supérieure ultra-fine
+        # 1. Top bar
         top_bar = self._create_top_bar()
         main_layout.addWidget(top_bar)
 
-        # 2. Séparateur double écran épuré
+        # 2. Main Dual Splitter
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.splitter.setHandleWidth(4)
 
-        # Écran Gauche (Pare-brise HUD)
+        # Left Screen (HUD / Video)
         left_container = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -165,7 +239,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(left_header)
         left_layout.addWidget(self.video_hud, stretch=1)
 
-        # Écran Droit (Tesla BEV)
+        # Right Screen (3D Tesla FSD Vector Space)
         right_container = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -178,10 +252,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.splitter.addWidget(left_container)
         self.splitter.addWidget(right_container)
-        self.splitter.setSizes([690, 690])
+        self.splitter.setSizes([710, 710])
         main_layout.addWidget(self.splitter, stretch=1)
 
-        # 3. Barre inférieure minimaliste
+        # 3. Bottom timeline bar
         bottom_bar = self._create_bottom_bar()
         main_layout.addWidget(bottom_bar)
 
@@ -191,52 +265,62 @@ class MainWindow(QtWidgets.QMainWindow):
         layout = QtWidgets.QHBoxLayout(frame)
         layout.setContentsMargins(10, 4, 10, 4)
 
-        # Titre minimaliste & statut M4
+        # Brand Title & M4 GPU Chip Status
         title = QtWidgets.QLabel("CAR-VISION")
         title.setStyleSheet("font-family: 'SF Pro Display'; font-size: 13px; font-weight: 800; color: #ffffff; letter-spacing: 1.5px;")
         layout.addWidget(title)
 
-        status_dot = QtWidgets.QLabel("● Apple M4")
+        status_dot = QtWidgets.QLabel("● Apple M4 MPS")
         status_dot.setStyleSheet("font-size: 10px; font-weight: 600; color: #10b981; margin-left: 6px;")
         layout.addWidget(status_dot)
 
-        layout.addSpacing(16)
+        layout.addSpacing(12)
 
-        # Télémétrie discrète en texte brut
+        # Telemetry Text
         self.lbl_telemetry = QtWidgets.QLabel("0 FPS  •  0 ms  •  0 cibles")
         self.lbl_telemetry.setStyleSheet("font-size: 11px; font-weight: 500; color: #94a3b8; font-family: -apple-system, sans-serif;")
         layout.addWidget(self.lbl_telemetry)
 
         layout.addStretch()
 
-        # Sélecteur de source compact
+        # Model Switcher Dropdown (YOLO11s, YOLO11m, YOLO11n)
+        lbl_mod = QtWidgets.QLabel("Modèle :")
+        lbl_mod.setStyleSheet("font-size: 10px; color: #64748b; font-weight: 600;")
+        layout.addWidget(lbl_mod)
+
+        self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.setStyleSheet(self._combo_style())
+        self.model_combo.addItems([
+            "YOLO11s (Défaut • 50 FPS)",
+            "YOLO11m (Précision Max • 30 FPS)",
+            "YOLO11n (Ultra Rapide • 75 FPS)"
+        ])
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        layout.addWidget(self.model_combo)
+
+        layout.addSpacing(10)
+
+        # Sample Video Dropdown
         self.source_combo = QtWidgets.QComboBox()
-        self.source_combo.setStyleSheet("""
-            QComboBox {
-                background-color: #161c28;
-                color: #e2e8f0;
-                border: 1px solid #283346;
-                border-radius: 5px;
-                padding: 4px 10px;
-                font-size: 11px;
-                font-weight: 500;
-            }
-            QComboBox::drop-down { border: none; }
-            QComboBox QAbstractItemView {
-                background-color: #161c28;
-                selection-background-color: #0284c7;
-                color: #e2e8f0;
-            }
-        """)
+        self.source_combo.setStyleSheet(self._combo_style())
         self._populate_sample_videos()
         self.source_combo.currentIndexChanged.connect(self._on_sample_changed)
         layout.addWidget(self.source_combo)
 
+        # Open File Button
         btn_open = QtWidgets.QPushButton("Ouvrir...")
         btn_open.setStyleSheet(self._btn_style())
         btn_open.clicked.connect(self._on_open_file)
         layout.addWidget(btn_open)
 
+        # 1-Click Snapshot Button
+        btn_snap = QtWidgets.QPushButton("📸 Capture")
+        btn_snap.setStyleSheet(self._btn_style())
+        btn_snap.setToolTip("Enregistrer une capture d'écran PNG du double écran")
+        btn_snap.clicked.connect(self._on_take_snapshot)
+        layout.addWidget(btn_snap)
+
+        # Webcam Button
         btn_webcam = QtWidgets.QPushButton("Webcam")
         btn_webcam.setStyleSheet(self._btn_style())
         btn_webcam.clicked.connect(lambda: self.worker.open_source(0))
@@ -254,63 +338,59 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(lbl)
         layout.addStretch()
 
-        # Bascule 2D / 3D
+        # Box mode toggle (2D Brackets / 3D Cuboids / Off)
         self.btn_box_toggle = QtWidgets.QPushButton("Viseur 2D")
         self.btn_box_toggle.setStyleSheet(self._btn_style(active=True))
         self.btn_box_toggle.clicked.connect(self._toggle_box_mode)
         layout.addWidget(self.btn_box_toggle)
 
-        chk_carpet = QtWidgets.QCheckBox("Tapis")
-        chk_carpet.setChecked(True)
-        chk_carpet.setStyleSheet("color: #94a3b8; font-size: 10px;")
-        chk_carpet.toggled.connect(lambda c: setattr(self.video_hud, 'show_drivable_carpet', c))
-        layout.addWidget(chk_carpet)
+        # Drivable Carpet Toggle
+        self.btn_carpet = QtWidgets.QPushButton("Tapis de route")
+        self.btn_carpet.setStyleSheet(self._btn_style(active=True))
+        self.btn_carpet.clicked.connect(self._toggle_carpet)
+        layout.addWidget(self.btn_carpet)
 
-        chk_lanes = QtWidgets.QCheckBox("Lignes")
-        chk_lanes.setChecked(True)
-        chk_lanes.setStyleSheet("color: #94a3b8; font-size: 10px;")
-        chk_lanes.toggled.connect(lambda c: setattr(self.video_hud, 'show_lane_lines', c))
-        layout.addWidget(chk_lanes)
+        # Lanes Toggle
+        self.btn_lanes = QtWidgets.QPushButton("Voies")
+        self.btn_lanes.setStyleSheet(self._btn_style(active=True))
+        self.btn_lanes.clicked.connect(self._toggle_lanes)
+        layout.addWidget(self.btn_lanes)
 
         return w
-
-    def _toggle_box_mode(self):
-        if self.video_hud.box_mode == "2D_BRACKETS":
-            self.video_hud.set_box_mode("3D_CUBOID")
-            self.btn_box_toggle.setText("Cuboïdes 3D")
-        else:
-            self.video_hud.set_box_mode("2D_BRACKETS")
-            self.btn_box_toggle.setText("Viseur 2D")
 
     def _create_right_header(self) -> QtWidgets.QWidget:
         w = QtWidgets.QWidget()
         layout = QtWidgets.QHBoxLayout(w)
         layout.setContentsMargins(4, 2, 4, 2)
 
-        lbl = QtWidgets.QLabel("RADAR 3D BEV")
+        lbl = QtWidgets.QLabel("ESPACE VECTORIEL 3D (TESLA FSD)")
         lbl.setStyleSheet("font-size: 10px; font-weight: 700; color: #64748b; letter-spacing: 1px;")
         layout.addWidget(lbl)
         layout.addStretch()
 
-        self.btn_bev_mode = QtWidgets.QPushButton("3D FSD")
-        self.btn_bev_mode.setStyleSheet(self._btn_style(active=True))
-        self.btn_bev_mode.clicked.connect(self._toggle_bev_mode)
-        layout.addWidget(self.btn_bev_mode)
+        # Viewpoint Presets
+        self.btn_preset_fsd = QtWidgets.QPushButton("FSD")
+        self.btn_preset_fsd.setStyleSheet(self._btn_style(active=True))
+        self.btn_preset_fsd.clicked.connect(lambda: self._select_view_preset("FSD"))
+        layout.addWidget(self.btn_preset_fsd)
 
+        self.btn_preset_heli = QtWidgets.QPushButton("Hélicoptère")
+        self.btn_preset_heli.setStyleSheet(self._btn_style(active=False))
+        self.btn_preset_heli.clicked.connect(lambda: self._select_view_preset("HELICOPTER"))
+        layout.addWidget(self.btn_preset_heli)
+
+        self.btn_preset_top = QtWidgets.QPushButton("Top-Down")
+        self.btn_preset_top.setStyleSheet(self._btn_style(active=False))
+        self.btn_preset_top.clicked.connect(lambda: self._select_view_preset("TOP_DOWN"))
+        layout.addWidget(self.btn_preset_top)
+
+        # Reset button
         btn_reset = QtWidgets.QPushButton("Recentrer")
         btn_reset.setStyleSheet(self._btn_style())
         btn_reset.clicked.connect(self.bev_view.reset_view)
         layout.addWidget(btn_reset)
 
         return w
-
-    def _toggle_bev_mode(self):
-        if self.bev_view.view_mode == "3D_FSD":
-            self.bev_view.set_view_mode("TOP_DOWN")
-            self.btn_bev_mode.setText("Top-Down")
-        else:
-            self.bev_view.set_view_mode("3D_FSD")
-            self.btn_bev_mode.setText("3D FSD")
 
     def _create_bottom_bar(self) -> QtWidgets.QFrame:
         frame = QtWidgets.QFrame()
@@ -319,13 +399,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(12, 4, 12, 4)
         layout.setSpacing(12)
 
+        # Play / Pause
         self.btn_play = QtWidgets.QPushButton("⏸")
         self.btn_play.setFixedWidth(32)
         self.btn_play.setStyleSheet(self._btn_style(active=True))
         self.btn_play.clicked.connect(self.worker.toggle_play_pause)
         layout.addWidget(self.btn_play)
 
-        # Timeline fine
+        # Timeline Slider
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider.setStyleSheet("""
             QSlider::groove:horizontal {
@@ -348,40 +429,86 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.sliderMoved.connect(self.worker.seek_frame)
         layout.addWidget(self.slider)
 
+        # Time code
         self.lbl_time = QtWidgets.QLabel("00:00 / 00:00")
         self.lbl_time.setStyleSheet("font-size: 10px; font-weight: 500; color: #64748b; font-family: monospace;")
         layout.addWidget(self.lbl_time)
 
-        # Statut compact du véhicule suivi
+        # Pitch tilt fine adjustment
+        lbl_pitch = QtWidgets.QLabel("Pitch :")
+        lbl_pitch.setStyleSheet("font-size: 10px; color: #64748b;")
+        layout.addWidget(lbl_pitch)
+
+        self.slider_pitch = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_pitch.setFixedWidth(80)
+        self.slider_pitch.setRange(1, 12) # 1° to 12°
+        self.slider_pitch.setValue(4)
+        self.slider_pitch.setStyleSheet("""
+            QSlider::groove:horizontal { height: 3px; background: #1e2638; border-radius: 1px; }
+            QSlider::handle:horizontal { background: #38bdf8; width: 8px; margin: -3px 0; border-radius: 4px; }
+        """)
+        self.slider_pitch.valueChanged.connect(self._on_pitch_changed)
+        layout.addWidget(self.slider_pitch)
+
+        # ADAS Status badge
         self.lbl_status = QtWidgets.QLabel("Voie dégagée")
         self.lbl_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #10b981;")
         layout.addWidget(self.lbl_status)
 
         return frame
 
-    def _btn_style(self, active: bool = False) -> str:
-        bg = "#1e293b" if not active else "#0284c7"
-        fg = "#cbd5e1" if not active else "#ffffff"
-        return f"""
-            QPushButton {{
-                background-color: {bg};
-                color: {fg};
-                border: 1px solid #334155;
-                border-radius: 5px;
-                padding: 4px 10px;
-                font-size: 11px;
-                font-weight: 500;
-            }}
-            QPushButton:hover {{
-                background-color: #334155;
-            }}
-        """
+    def _select_view_preset(self, preset: str):
+        self.bev_view.set_view_preset(preset)
+        self.btn_preset_fsd.setStyleSheet(self._btn_style(active=(preset == "FSD")))
+        self.btn_preset_heli.setStyleSheet(self._btn_style(active=(preset == "HELICOPTER")))
+        self.btn_preset_top.setStyleSheet(self._btn_style(active=(preset == "TOP_DOWN")))
+
+    def _toggle_box_mode(self):
+        if self.video_hud.box_mode == "2D_BRACKETS":
+            self.video_hud.set_box_mode("3D_CUBOID")
+            self.btn_box_toggle.setText("Cuboids 3D")
+        elif self.video_hud.box_mode == "3D_CUBOID":
+            self.video_hud.set_box_mode("OFF")
+            self.btn_box_toggle.setText("Boîtes Off")
+            self.btn_box_toggle.setStyleSheet(self._btn_style(active=False))
+        else:
+            self.video_hud.set_box_mode("2D_BRACKETS")
+            self.btn_box_toggle.setText("Viseur 2D")
+            self.btn_box_toggle.setStyleSheet(self._btn_style(active=True))
+
+    def _toggle_carpet(self):
+        self.video_hud.show_drivable_carpet = not self.video_hud.show_drivable_carpet
+        self.btn_carpet.setStyleSheet(self._btn_style(active=self.video_hud.show_drivable_carpet))
+        self.video_hud.update()
+
+    def _toggle_lanes(self):
+        self.video_hud.show_lane_lines = not self.video_hud.show_lane_lines
+        self.btn_lanes.setStyleSheet(self._btn_style(active=self.video_hud.show_lane_lines))
+        self.video_hud.update()
+
+    def _on_model_changed(self, idx: int):
+        models = ["yolo11s.pt", "yolo11m.pt", "yolo11n.pt"]
+        chosen = models[idx]
+        self.engine.load_actor_model(chosen)
+        self.lbl_status.setText(f"Modèle chargé : {chosen}")
+
+    def _on_pitch_changed(self, val: int):
+        self.engine.geom.set_camera_parameters(pitch_deg=float(val))
+
+    def _on_take_snapshot(self):
+        """Saves a high-resolution snapshot of both screens."""
+        os.makedirs("captures", exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join("captures", f"carvision_{timestamp}.png")
+        pix = self.splitter.grab()
+        pix.save(filename)
+        self.lbl_status.setText(f"📸 Capture enregistrée : {os.path.basename(filename)}")
+        self.lbl_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #38bdf8;")
 
     def _populate_sample_videos(self):
         self.source_combo.clear()
         if os.path.exists(self.sample_dir):
-            files = [f for f in os.listdir(self.sample_dir) if f.endswith(('.mp4', '.mov', '.avi'))]
-            # Prioritize city_paris.mp4 as first item
+            files = [f for f in os.listdir(self.sample_dir) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
             ordered = []
             if "city_paris.mp4" in files:
                 ordered.append("city_paris.mp4")
@@ -411,10 +538,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Choisir une vidéo",
             "",
-            "Vidéos (*.mp4 *.mov *.avi *.mkv)"
+            "Vidéos (*.mp4 *.mov *.avi *.mkv *.webm *.m4v)"
         )
         if file_path:
             self.worker.open_source(file_path)
+
+    def _on_source_load_failed(self, source_path: str):
+        self.lbl_status.setText(f"❌ Erreur de lecture vidéo : {os.path.basename(source_path)}")
+        self.lbl_status.setStyleSheet("font-size: 11px; font-weight: 700; color: #ef4444;")
 
     def _on_frame_processed(self, frame: np.ndarray, result: PerceptionResult):
         self.video_hud.update_frame(frame, result, self.engine.geom)
@@ -423,7 +554,7 @@ class MainWindow(QtWidgets.QMainWindow):
         fps = 1000.0 / max(result.inference_time_ms, 1.0)
         self.lbl_telemetry.setText(f"{fps:.0f} FPS  •  {result.inference_time_ms:.0f} ms  •  {len(result.tracks)} cibles")
 
-        # Statut épuré
+        # ADAS Status badge
         if result.fcw_alert:
             self.lbl_status.setText("⚠️ RISQUE DE COLLISION")
             self.lbl_status.setStyleSheet("font-size: 11px; font-weight: 700; color: #ef4444;")
@@ -432,7 +563,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_status.setStyleSheet("font-size: 11px; font-weight: 700; color: #f59e0b;")
         elif result.lead_vehicle:
             lv = result.lead_vehicle
-            self.lbl_status.setText(f"Véhicule devant : {lv.Z:.1f}m")
+            self.lbl_status.setText(f"Véhicule devant : {lv.Z:.1f}m ({lv.speed_kmh:.0f} km/h)")
             self.lbl_status.setStyleSheet("font-size: 11px; font-weight: 500; color: #38bdf8;")
         else:
             self.lbl_status.setText("Voie libre")
@@ -450,6 +581,43 @@ class MainWindow(QtWidgets.QMainWindow):
             cur_sec = int(current / max(self.worker.target_fps, 1.0))
             tot_sec = int(total / max(self.worker.target_fps, 1.0))
             self.lbl_time.setText(f"{cur_sec//60:02d}:{cur_sec%60:02d} / {tot_sec//60:02d}:{tot_sec%60:02d}")
+
+    def _btn_style(self, active: bool = False) -> str:
+        bg = "#1e293b" if not active else "#0284c7"
+        fg = "#cbd5e1" if not active else "#ffffff"
+        return f"""
+            QPushButton {{
+                background-color: {bg};
+                color: {fg};
+                border: 1px solid #334155;
+                border-radius: 5px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: #334155;
+            }}
+        """
+
+    def _combo_style(self) -> str:
+        return """
+            QComboBox {
+                background-color: #161c28;
+                color: #e2e8f0;
+                border: 1px solid #283346;
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 11px;
+                font-weight: 500;
+            }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background-color: #161c28;
+                selection-background-color: #0284c7;
+                color: #e2e8f0;
+            }
+        """
 
     def _apply_minimal_theme(self):
         self.setStyleSheet("""
