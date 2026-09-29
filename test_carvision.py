@@ -70,7 +70,7 @@ def test_tracker():
 
 def test_samples():
     print("[TEST 3/5] Testing Sample Driving Videos...")
-    sample_files = ["highway.mp4", "car-detection.mp4", "person-bicycle-car-detection.mp4"]
+    sample_files = ["city_paris.mp4", "highway.mp4", "car-detection.mp4", "person-bicycle-car-detection.mp4"]
     for s in sample_files:
         path = os.path.join("samples", s)
         assert os.path.exists(path), f"Missing sample video: {path}"

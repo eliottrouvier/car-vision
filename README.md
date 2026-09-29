@@ -92,12 +92,21 @@ carvision
 
 ## 4. Fonctionnalités de l'interface
 
-- **Sélecteur de source** : Vidéos de démonstration incluses (`highway.mp4`, `car-detection.mp4`, `person-bicycle-car-detection.mp4`), ouverture de fichier local ou webcam en direct.
-- **Contrôles HUD** : Activation/désactivation à la volée du tapis de route, des lignes de voies, des boîtes 3D filaires et des passages piétons.
-- **Navigation BEV** :
-  - `Vue 3D FSD` : Perspective isométrique 3e personne derrière le véhicule hôte.
+- **Sélecteur de source** :
+  - `Ville (Paris)` (**défaut**) : Conduite urbaine avec voitures, piétons sur trottoir/chaussée, carrefours.
+  - `Autoroute` : Trafic rapide multi-voies avec dépassements et virages.
+  - `Piétons & Cyclistes` : Scène urbaine de détection d'usagers vulnérables.
+  - `Circulation urbaine` : Trafic dense en ville.
+  - `Ouvrir...` : Choix d'un fichier vidéo local (`.mp4`, `.mov`, etc.).
+  - `Webcam` : Flux en direct d'une caméra USB ou FaceTime.
+- **HUD Pare-brise Minimaliste** :
+  - **Viseur 2D (angles fins)** : Boîtes de détection tactiques avec étiquette discrète (`Voiture 5.2m`, `Piéton 3.4m`).
+  - **Cuboïdes 3D** : Bascule en un clic vers les boîtes filaires 3D projetées sur le sol.
+  - **Tapis & Lignes** : Activation/désactivation instantanée du tapis de route émeraude et des marquages.
+- **Radar BEV 3D (Tesla FSD)** :
+  - `3D FSD` : Perspective isométrique 3e personne derrière le véhicule hôte.
   - `Top-Down` : Carte radar orthogonale 90°.
   - Molette souris : Zoom métrique (5m à 120m).
   - Clic-glisser : Déplacement de la vue.
-  - Double-clic : Recentrage vue par défaut.
-- **Télémétrie en direct** : FPS, latence GPU (MPS), véhicule de tête (distance + TTC), alerte anticollision FCW (*Forward Collision Warning*), et alertes piétons.
+  - Double-clic / `Recentrer` : Réinitialisation de la vue.
+- **Télémétrie épurée** : Compteurs FPS et latence discrets, état de la voie et distance du véhicule suivi.
