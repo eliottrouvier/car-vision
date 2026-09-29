@@ -15,6 +15,7 @@ from ultralytics import YOLO
 
 from bev_geometry import BEVGeometry
 from tracker import CarVisionTracker, TrackedObject
+from visual_odometry import VisualOdometry
 
 
 class PerceptionResult:
@@ -34,7 +35,9 @@ class PerceptionResult:
         fcw_alert: bool,
         pedestrian_alert: bool,
         ego_speed_estimate: float,
-        horizon_y: int
+        horizon_y: int,
+        is_camera_moving: bool = True,
+        foe: Optional[Tuple[float, float]] = None
     ):
         self.frame_idx = frame_idx
         self.timestamp = timestamp
@@ -50,6 +53,8 @@ class PerceptionResult:
         self.pedestrian_alert = pedestrian_alert
         self.ego_speed_estimate = ego_speed_estimate
         self.horizon_y = horizon_y
+        self.is_camera_moving = is_camera_moving
+        self.foe = foe
 
 
 class PanopticPerceptionEngine:
@@ -113,10 +118,11 @@ class PanopticPerceptionEngine:
             fov_deg=fov_deg
         )
         self.tracker = CarVisionTracker(max_missed=6, metric_dist_thresh=4.5)
+        self.vo = VisualOdometry()
 
         self.last_timestamp = time.time()
         self.frame_idx = 0
-        self.ego_speed_estimate = 72.0 # km/h baseline estimate
+        self.ego_speed_estimate = 0.0
 
     def _preprocess_yolop(self, frame: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
@@ -367,6 +373,13 @@ class PanopticPerceptionEngine:
                 min_lead_z = trk.Z
                 lead_vehicle = trk
 
+        # 6. Optical Flow Camera Motion & Visual Odometry
+        actor_boxes = [trk.box_2d for trk in tracks]
+        is_camera_moving, ego_speed, foe = self.vo.update(frame, actor_boxes)
+        if is_camera_moving and foe is not None:
+            self.geom.update_vanishing_point(foe[0], foe[1])
+        self.ego_speed_estimate = ego_speed
+
         # Horizon y coordinate
         horizon_y = int(round(self.geom.v_horizon))
 
@@ -386,5 +399,7 @@ class PanopticPerceptionEngine:
             fcw_alert=fcw_alert,
             pedestrian_alert=pedestrian_alert,
             ego_speed_estimate=self.ego_speed_estimate,
-            horizon_y=horizon_y
+            horizon_y=horizon_y,
+            is_camera_moving=is_camera_moving,
+            foe=foe
         )

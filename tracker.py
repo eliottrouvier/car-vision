@@ -27,6 +27,7 @@ class TrackedObject:
         # Kinematic state
         self.vx = 0.0 # m/s
         self.vz = 0.0 # m/s
+        self.yaw = 0.0 # heading angle in radians (0 = straight ahead along Z)
         self.speed_kmh = 0.0
         self.ttc: Optional[float] = None
         self.in_ego_lane: bool = False
@@ -60,6 +61,9 @@ class TrackedObject:
             # Relative speed magnitude
             rel_speed_mps = np.sqrt(self.vx**2 + self.vz**2)
             self.speed_kmh = float(rel_speed_mps * 3.6)
+            if rel_speed_mps > 0.4:
+                target_yaw = float(np.arctan2(self.vx, self.vz))
+                self.yaw = 0.7 * self.yaw + 0.3 * target_yaw
 
         self.box_2d = list(box_2d)
         self.confidence = confidence
