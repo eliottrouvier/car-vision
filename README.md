@@ -1,6 +1,7 @@
 # car-vision
 
-Pipeline de perception autonome panoptique temps réel avec projection 3D Bird's-Eye View (BEV style Tesla FSD / Waymo), exécuté à 100% en local sur Apple Silicon (GPU Metal / MPS).
+> **Tech Stack : Python • PyTorch (MPS) • YOLOPv2 • YOLO11 • OpenCV • PySide6**  
+> Real-time autonomous panoptic perception pipeline and 3D Bird's-Eye View (Tesla FSD style) cockpit, running 100% locally on Apple Silicon (Metal/MPS).
 
 ---
 
