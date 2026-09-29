@@ -1,7 +1,7 @@
 """
 perception_engine.py - Unified Panoptic Perception Engine for Autonomous Driving.
-Integrates YOLOPv2 (Drivable Road & Lane Segmentation) with YOLO11 High-Accuracy
-Actor Detection, Robust Hybrid 3D Metric Projection, and Collision Risk Assessment.
+Integrates YOLOPv2 Panoptic Road Segmentation with YOLO11 High-Accuracy Actor Detection,
+Pedestrian Crowd Clustering, Adaptive Cadence Scheduling, and 3D Metric Projection.
 """
 
 from typing import List, Dict, Any, Optional, Tuple
@@ -39,7 +39,8 @@ class PerceptionResult:
         horizon_y: int,
         is_camera_moving: bool = True,
         foe: Optional[Tuple[float, float]] = None,
-        trajectory_corridor: Optional[List[Tuple[float, float]]] = None
+        trajectory_corridor: Optional[List[Tuple[float, float]]] = None,
+        pedestrian_groups: Optional[List[Dict[str, Any]]] = None
     ):
         self.frame_idx = frame_idx
         self.timestamp = timestamp
@@ -58,11 +59,13 @@ class PerceptionResult:
         self.is_camera_moving = is_camera_moving
         self.foe = foe
         self.trajectory_corridor = trajectory_corridor or []
+        self.pedestrian_groups = pedestrian_groups or []
 
 
 class PanopticPerceptionEngine:
     """
     Unified high-performance panoptic engine targeting Apple Silicon M4 GPU (MPS).
+    Includes adaptive cadence scheduling and pedestrian crowd clustering.
     """
 
     def __init__(
@@ -118,6 +121,23 @@ class PanopticPerceptionEngine:
         self.tracker = CarVisionTracker(max_missed=10, metric_dist_thresh=4.8)
         self.vo = VisualOdometry()
 
+        # Performance tuning & adaptive cadence
+        self.yolop_cadence = 3             # Run YOLOPv2 every N frames
+        self.vo_cadence = 3                # Run Optical Flow every N frames
+        self.imgsz = 640                   # YOLO inference size (480..640)
+        self.actor_conf = 0.20             # Detection confidence threshold
+        self.enable_pedestrian_grouping = True
+
+        # Cached panoptic representations for intermediate frames
+        self._cached_drivable_mask: Optional[np.ndarray] = None
+        self._cached_lane_mask: Optional[np.ndarray] = None
+        self._cached_bev_lanes_3d: List[Tuple[float, float]] = []
+        self._cached_bev_carpet_3d: List[Tuple[float, float]] = []
+        self._cached_crosswalks: List[Dict[str, Any]] = []
+        self._cached_is_moving = True
+        self._cached_ego_speed = 0.0
+        self._cached_foe: Optional[Tuple[float, float]] = None
+
         self.last_timestamp = time.time()
         self.frame_idx = 0
         self.ego_speed_estimate = 0.0
@@ -131,6 +151,30 @@ class PanopticPerceptionEngine:
             print(f"[PerceptionEngine] Actor model {model_name} loaded successfully.")
         except Exception as e:
             print(f"[PerceptionEngine] Failed to load {model_name}: {e}")
+
+    def set_performance_level(self, level: float):
+        """
+        Adjusts performance trade-off smoothly between 0.0 (Max Speed) and 1.0 (Max Precision).
+        """
+        level = float(np.clip(level, 0.0, 1.0))
+        if level <= 0.33:
+            # High-FPS Mode
+            self.imgsz = 480
+            self.actor_conf = 0.25
+            self.yolop_cadence = 4
+            self.vo_cadence = 4
+        elif level <= 0.66:
+            # Balanced Mode
+            self.imgsz = 576
+            self.actor_conf = 0.20
+            self.yolop_cadence = 3
+            self.vo_cadence = 3
+        else:
+            # High-Precision Mode
+            self.imgsz = 640
+            self.actor_conf = 0.18
+            self.yolop_cadence = 2
+            self.vo_cadence = 2
 
     def _preprocess_yolop(self, frame: np.ndarray) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
@@ -158,23 +202,21 @@ class PanopticPerceptionEngine:
         """
         orig_w, orig_h = orig_shape
 
-        # 1. Drivable area (seg_out: shape [1, 2, 384, 640])
+        # 1. Drivable area
         seg_pred = torch.argmax(seg_out, dim=1).squeeze().cpu().numpy().astype(np.uint8)
-        # Crop unpadded region [12:372]
         seg_cropped = seg_pred[12:372, :]
         drivable_mask = cv2.resize(seg_cropped, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
-        # 2. Lane lines (ll_out: shape [1, 1, 384, 640])
+        # 2. Lane lines
         ll_pred = (torch.sigmoid(ll_out).squeeze() > 0.45).cpu().numpy().astype(np.uint8)
         ll_cropped = ll_pred[12:372, :]
         lane_mask = cv2.resize(ll_cropped, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
         return drivable_mask, lane_mask
 
-    def _detect_actors(self, frame: np.ndarray, conf_thresh: float = 0.20) -> List[Dict[str, Any]]:
+    def _detect_actors(self, frame: np.ndarray) -> List[Dict[str, Any]]:
         """
-        High-Recall Road Actor Detection:
-        Detects vehicles, pedestrians, cyclists and computes hybrid 3D metric coordinates.
+        High-Recall Road Actor Detection with Hybrid 3D Metric Coordinates.
         """
         detections = []
         if self.actor_model is None:
@@ -189,8 +231,14 @@ class PanopticPerceptionEngine:
             7: 'truck'
         }
 
-        # Run model inference on MPS
-        results = self.actor_model(frame, device='mps', verbose=False, conf=conf_thresh, iou=0.45)
+        results = self.actor_model(
+            frame,
+            device='mps',
+            verbose=False,
+            conf=self.actor_conf,
+            imgsz=self.imgsz,
+            iou=0.45
+        )
         for r in results:
             for b in r.boxes:
                 cls_id = int(b.cls.item())
@@ -201,18 +249,16 @@ class PanopticPerceptionEngine:
                 conf = float(b.conf.item())
                 xyxy = [float(x) for x in b.xyxy[0].tolist()]
 
-                # Filter out microscopic noise boxes
                 bw = xyxy[2] - xyxy[0]
                 bh = xyxy[3] - xyxy[1]
                 if bw < 8 or bh < 8:
                     continue
 
-                # Hybrid 3D Depth Estimation (fusing ground IPM + box height prior)
-                X, Z, z_prior = self.geom.estimate_actor_3d(xyxy, class_name)
+                # Hybrid 3D Depth Estimation
+                X, Z, _ = self.geom.estimate_actor_3d(xyxy, class_name)
                 if X is None or Z is None or Z < 0.5 or Z > 140.0:
                     continue
 
-                # 3D Bounding cuboid corners
                 corners_3d = self.geom.get_3d_box_corners(X, Z, class_name, yaw=0.0)
 
                 detections.append({
@@ -225,31 +271,133 @@ class PanopticPerceptionEngine:
 
         return detections
 
+    def _cluster_pedestrians(
+        self,
+        detections: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Crowd Clustering: Merges pedestrians walking together into unified
+        'person_group' entities with 2D & 3D convex hull boundaries.
+        Significantly reduces tracking overhead and cleans up visual clutter.
+        """
+        if not self.enable_pedestrian_grouping:
+            return detections, []
+
+        persons = [d for d in detections if d['class_name'] == 'person']
+        others = [d for d in detections if d['class_name'] != 'person']
+
+        if len(persons) <= 1:
+            return detections, []
+
+        n = len(persons)
+        adj = {i: [] for i in range(n)}
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                xi, zi = persons[i]['pos_3d']
+                xj, zj = persons[j]['pos_3d']
+                dist_3d = math.hypot(xi - xj, zi - zj)
+
+                bi = persons[i]['box_2d']
+                bj = persons[j]['box_2d']
+                dx = max(0.0, min(bi[2], bj[2]) - max(bi[0], bj[0]))
+
+                # Cluster if within 1.6m on ground or overlapping horizontally
+                if dist_3d < 1.6 or (dx > 0 and dist_3d < 2.5):
+                    adj[i].append(j)
+                    adj[j].append(i)
+
+        visited = set()
+        clusters = []
+        for i in range(n):
+            if i not in visited:
+                comp = []
+                queue = [i]
+                visited.add(i)
+                while queue:
+                    curr = queue.pop(0)
+                    comp.append(curr)
+                    for neighbor in adj[curr]:
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append(neighbor)
+                clusters.append(comp)
+
+        merged = list(others)
+        groups = []
+
+        for comp in clusters:
+            if len(comp) == 1:
+                merged.append(persons[comp[0]])
+            else:
+                members = [persons[k] for k in comp]
+                min_x1 = min(m['box_2d'][0] for m in members)
+                min_y1 = min(m['box_2d'][1] for m in members)
+                max_x2 = max(m['box_2d'][2] for m in members)
+                max_y2 = max(m['box_2d'][3] for m in members)
+
+                # 2D Convex Hull
+                corners_2d = []
+                for m in members:
+                    b = m['box_2d']
+                    corners_2d.extend([[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]])
+                hull_2d_raw = cv2.convexHull(np.array(corners_2d, dtype=np.float32))
+                hull_2d = [tuple(pt[0]) for pt in hull_2d_raw]
+
+                # 3D Centroid and Convex Hull
+                x_mean = float(np.mean([m['pos_3d'][0] for m in members]))
+                z_mean = float(np.mean([m['pos_3d'][1] for m in members]))
+
+                pts_3d = []
+                for m in members:
+                    mx, mz = m['pos_3d']
+                    r = 0.5
+                    pts_3d.extend([[mx - r, mz], [mx + r, mz], [mx, mz - r], [mx, mz + r]])
+                hull_3d_raw = cv2.convexHull(np.array(pts_3d, dtype=np.float32))
+                hull_3d = [tuple(pt[0]) for pt in hull_3d_raw]
+
+                corners_3d = self.geom.get_3d_box_corners(x_mean, z_mean, 'person_group', yaw=0.0)
+
+                grp_det = {
+                    'box_2d': [min_x1, min_y1, max_x2, max_y2],
+                    'class_name': 'person_group',
+                    'confidence': float(np.mean([m['confidence'] for m in members])),
+                    'pos_3d': (x_mean, z_mean),
+                    'corners_3d': corners_3d,
+                    'group_size': len(members),
+                    'hull_2d': hull_2d,
+                    'hull_3d': hull_3d
+                }
+                merged.append(grp_det)
+                groups.append(grp_det)
+
+        return merged, groups
+
     def _estimate_lane_vanishing_point(self, lane_mask: np.ndarray) -> Optional[Tuple[float, float]]:
         """
-        Calculates the vanishing point where left and right lane boundary lines intersect.
+        Calculates vanishing point where left and right lane boundaries converge.
         """
         h, w = lane_mask.shape
         roi = lane_mask[int(h * 0.45):, :]
         v_offset = int(h * 0.45)
 
-        # Split left and right halves
         mid_x = w // 2
         left_pts = np.argwhere(roi[:, :mid_x] > 0)
         right_pts = np.argwhere(roi[:, mid_x:] > 0)
 
-        if len(left_pts) < 50 or len(right_pts) < 50:
+        if len(left_pts) < 40 or len(right_pts) < 40:
             return None
 
-        # Fit lines to left and right lane markings
-        # cv2.fitLine returns [vx, vy, x0, y0]
-        left_line = cv2.fitLine(np.column_stack((left_pts[:, 1], left_pts[:, 0] + v_offset)), cv2.DIST_L2, 0, 0.01, 0.01)
-        right_line = cv2.fitLine(np.column_stack((right_pts[:, 1] + mid_x, right_pts[:, 0] + v_offset)), cv2.DIST_L2, 0, 0.01, 0.01)
+        # Sample points to speed up fitLine
+        sub_l = left_pts[::10]
+        sub_r = right_pts[::10]
+
+        left_line = cv2.fitLine(np.column_stack((sub_l[:, 1], sub_l[:, 0] + v_offset)), cv2.DIST_L2, 0, 0.01, 0.01)
+        right_line = cv2.fitLine(np.column_stack((sub_r[:, 1] + mid_x, sub_r[:, 0] + v_offset)), cv2.DIST_L2, 0, 0.01, 0.01)
 
         vx1, vy1, x1, y1 = [float(val[0]) for val in left_line]
         vx2, vy2, x2, y2 = [float(val[0]) for val in right_line]
 
-        # Check line convergence
         denom = vx1 * vy2 - vy1 * vx2
         if abs(denom) < 1e-4:
             return None
@@ -258,7 +406,6 @@ class PanopticPerceptionEngine:
         vp_x = x1 + t * vx1
         vp_y = y1 + t * vy1
 
-        # Check if vanishing point lies near reasonable horizon
         if 0 < vp_x < w and 0.2 * h < vp_y < 0.65 * h:
             return float(vp_x), float(vp_y)
 
@@ -292,10 +439,8 @@ class PanopticPerceptionEngine:
         _, white_mask = cv2.threshold(road_gray, thresh_val, 255, cv2.THRESH_BINARY)
         white_mask[:roi_top, :] = 0
 
-        # Morphological filter for zebra stripes
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 7))
         stripes = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, kernel)
-
         contours, _ = cv2.findContours(stripes, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         stripe_boxes = []
@@ -334,8 +479,6 @@ class PanopticPerceptionEngine:
             max_x = max(b[0] + b[2] for b in grp)
             min_y = min(b[1] for b in grp)
             max_y = max(b[1] + b[3] for b in grp)
-            u_mid = (min_x + max_x) / 2.0
-            v_bot = float(max_y)
             X, Z, _ = self.geom.estimate_actor_3d([min_x, min_y, max_x, max_y], "default")
             if Z is not None and 2.0 <= Z <= 75.0:
                 crosswalks.append({
@@ -354,12 +497,10 @@ class PanopticPerceptionEngine:
         length_m: float = 38.0
     ) -> List[Tuple[float, float]]:
         """
-        Computes the projected path ribbon (driving carpet) ahead of the ego vehicle.
-        Curvature follows visual odometry and road center.
+        Computes the projected path ribbon ahead of the ego vehicle.
         """
         pts = []
-        num_steps = 20
-        # Dynamic corridor curvature based on camera yaw / turn
+        num_steps = 18
         curve_factor = math.tan(self.geom.yaw) * 0.6 if is_moving else 0.0
 
         for i in range(num_steps + 1):
@@ -376,7 +517,7 @@ class PanopticPerceptionEngine:
         enable_detection: bool = True
     ) -> PerceptionResult:
         """
-        Runs complete perception pipeline on a single frame.
+        Runs complete perception pipeline with adaptive cadence scheduling.
         """
         t0 = time.time()
         self.frame_idx += 1
@@ -386,11 +527,12 @@ class PanopticPerceptionEngine:
         dt = max(0.01, min(t0 - self.last_timestamp, 0.2))
         self.last_timestamp = t0
 
-        drivable_mask = np.zeros((h, w), dtype=np.uint8)
-        lane_mask = np.zeros((h, w), dtype=np.uint8)
+        # Determine whether to run YOLOPv2 on this frame
+        run_panoptic = enable_panoptic and (
+            (self.frame_idx % self.yolop_cadence == 0) or (self._cached_drivable_mask is None)
+        )
 
-        # 1. Panoptic Road Segmentation (YOLOPv2)
-        if enable_panoptic and self.yolop_model is not None:
+        if run_panoptic and self.yolop_model is not None:
             tensor, orig_shape = self._preprocess_yolop(frame)
             with torch.no_grad():
                 out = self.yolop_model(tensor)
@@ -398,26 +540,58 @@ class PanopticPerceptionEngine:
                 ll_out = out[2]
                 drivable_mask, lane_mask = self._postprocess_yolop_masks(seg_out, ll_out, orig_shape)
 
-        # 2. Object Detection & 3D Metric Projection
+            self._cached_drivable_mask = drivable_mask
+            self._cached_lane_mask = lane_mask
+
+            # Project 3D Lanes (Vectorized with NumPy)
+            self._cached_bev_lanes_3d = self.geom.unproject_lane_mask(lane_mask, step=12, z_max=85.0)
+
+            # Project 3D Road Polygon
+            if np.count_nonzero(drivable_mask) > 100:
+                self._cached_bev_carpet_3d = self.geom.unproject_road_polygon(drivable_mask, z_max=80.0)
+
+            # Crosswalks
+            self._cached_crosswalks = self._detect_crosswalks(frame, drivable_mask)
+
+            # Lane Vanishing Point
+            lane_vp = self._estimate_lane_vanishing_point(lane_mask)
+            if lane_vp is not None:
+                self.geom.update_vanishing_point(lane_vp[0], lane_vp[1], smoothing=0.97)
+
+        drivable_mask = self._cached_drivable_mask if self._cached_drivable_mask is not None else np.zeros((h, w), dtype=np.uint8)
+        lane_mask = self._cached_lane_mask if self._cached_lane_mask is not None else np.zeros((h, w), dtype=np.uint8)
+        bev_lanes_3d = self._cached_bev_lanes_3d
+        bev_carpet_3d = self._cached_bev_carpet_3d
+        crosswalks = self._cached_crosswalks
+
+        # 2. Object Detection (Cars, Trucks, Pedestrians, Cyclists)
         detections = []
         if enable_detection:
             detections = self._detect_actors(frame)
 
-        # 3. Multi-Object Kinematic 3D Tracking
-        tracks = self.tracker.update(detections, dt=dt)
+        # 3. Crowd Clustering (Merge pedestrians walking together)
+        clustered_detections, pedestrian_groups = self._cluster_pedestrians(detections)
 
-        # 4. Crosswalk Detection
-        crosswalks = self._detect_crosswalks(frame, drivable_mask if enable_panoptic else None)
+        # 4. Multi-Object Kinematic 3D Tracking
+        tracks = self.tracker.update(clustered_detections, dt=dt)
 
-        # 5. Project 3D Lanes to BEV
-        bev_lanes_3d = self.geom.unproject_lane_mask(lane_mask, step=5, z_max=85.0)
+        # 5. Visual Odometry & Motion Cadence
+        run_vo = (self.frame_idx % self.vo_cadence == 0)
+        if run_vo:
+            actor_boxes = [trk.box_2d for trk in tracks]
+            is_moving, ego_speed, foe = self.vo.update(frame, actor_boxes)
+            self._cached_is_moving = is_moving
+            self._cached_ego_speed = ego_speed
+            self._cached_foe = foe
+            if is_moving and foe is not None:
+                self.geom.update_vanishing_point(foe[0], foe[1], smoothing=0.98)
 
-        # 6. Extract Faithful Drivable Road Polygon for BEV Carpet
-        bev_carpet_3d = []
-        if enable_panoptic and np.count_nonzero(drivable_mask) > 100:
-            bev_carpet_3d = self.geom.unproject_road_polygon(drivable_mask, z_max=80.0)
+        is_camera_moving = self._cached_is_moving
+        ego_speed = self._cached_ego_speed
+        foe = self._cached_foe
+        self.ego_speed_estimate = ego_speed
 
-        # 7. Collision Flags & Lead Vehicle Assessment
+        # 6. Safety Flags & Lead Vehicle Assessment
         lead_vehicle = None
         fcw_alert = False
         pedestrian_alert = False
@@ -426,27 +600,14 @@ class PanopticPerceptionEngine:
         for trk in tracks:
             if trk.warning_level == 'critical':
                 fcw_alert = True
-            if trk.class_name in ('person', 'bicycle') and trk.warning_level in ('critical', 'caution'):
+            if trk.class_name in ('person', 'person_group', 'bicycle') and trk.warning_level in ('critical', 'caution'):
                 pedestrian_alert = True
 
             if trk.in_ego_lane and 1.0 < trk.Z < min_lead_z:
                 min_lead_z = trk.Z
                 lead_vehicle = trk
 
-        # 8. Optical Flow Camera Motion & Vanishing Point Auto-Calibration
-        actor_boxes = [trk.box_2d for trk in tracks]
-        is_camera_moving, ego_speed, foe = self.vo.update(frame, actor_boxes)
-
-        # Auto-calibrate horizon & vanishing point
-        lane_vp = self._estimate_lane_vanishing_point(lane_mask)
-        if lane_vp is not None:
-            self.geom.update_vanishing_point(lane_vp[0], lane_vp[1], smoothing=0.97)
-        elif is_camera_moving and foe is not None:
-            self.geom.update_vanishing_point(foe[0], foe[1], smoothing=0.98)
-
-        self.ego_speed_estimate = ego_speed
-
-        # 9. Trajectory Corridor Ahead of Host Car
+        # 7. Driving Trajectory Corridor
         trajectory_corridor = self.compute_trajectory_corridor(
             ego_speed=ego_speed,
             is_moving=is_camera_moving,
@@ -473,5 +634,6 @@ class PanopticPerceptionEngine:
             horizon_y=horizon_y,
             is_camera_moving=is_camera_moving,
             foe=foe,
-            trajectory_corridor=trajectory_corridor
+            trajectory_corridor=trajectory_corridor,
+            pedestrian_groups=pedestrian_groups
         )

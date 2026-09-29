@@ -524,10 +524,90 @@ class BEVWidget(QtWidgets.QWidget):
 
         if trk.class_name == 'person':
             self._draw_3d_pedestrian(painter, trk, w, h, is_hovered, is_lead)
+        elif trk.class_name == 'person_group':
+            self._draw_3d_pedestrian_group(painter, trk, w, h, is_hovered, is_lead)
         elif trk.class_name in ('bicycle', 'motorcycle'):
             self._draw_3d_twowheeler(painter, trk, w, h, is_hovered, is_lead)
         else:
             self._draw_3d_vehicle(painter, trk, w, h, is_hovered, is_lead)
+
+    def _draw_3d_pedestrian_group(
+        self,
+        painter: QtGui.QPainter,
+        trk: TrackedObject,
+        w: int,
+        h: int,
+        is_hovered: bool,
+        is_lead: bool
+    ):
+        """Render pedestrian group with semi-transparent convex hull bubble and silhouettes."""
+        X, Z = trk.X, trk.Z
+        gx, gy, sc = self._project(X, Z, w, h)
+        self._actor_screen_positions[trk.track_id] = QtCore.QPointF(gx, gy)
+
+        color = QtGui.QColor(255, 95, 135) # Coral Pink
+
+        # Find matching group for 3D convex hull
+        matching_grp = None
+        if self.current_result:
+            for grp in self.current_result.pedestrian_groups:
+                if math.hypot(grp['pos_3d'][0] - X, grp['pos_3d'][1] - Z) < 2.2:
+                    matching_grp = grp
+                    break
+
+        grp_size = matching_grp.get('group_size', 2) if matching_grp else 2
+
+        # 3D Convex Hull Ground Bubble
+        if matching_grp and 'hull_3d' in matching_grp and len(matching_grp['hull_3d']) >= 3:
+            hull_screen = []
+            for hx, hz in matching_grp['hull_3d']:
+                hsx, hsy, _ = self._project(hx, hz, w, h)
+                hull_screen.append(QtCore.QPointF(hsx, hsy))
+            poly = QtGui.QPolygonF(hull_screen)
+            painter.setPen(QtGui.QPen(color, 1.8, QtCore.Qt.DashLine))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 95, 135, 45)))
+            painter.drawPolygon(poly)
+        else:
+            # Fallback elliptic safety bubble
+            r_x = max(10.0, 18.0 * sc)
+            r_y = max(6.0, 10.0 * sc)
+            painter.setPen(QtGui.QPen(color, 1.6, QtCore.Qt.DashLine))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 95, 135, 40)))
+            painter.drawEllipse(QtCore.QPointF(gx, gy), r_x, r_y)
+
+        # Draw 2 to 3 simplified human figure silhouettes inside
+        offsets = [(-0.5, 0.0), (0.5, 0.0)] if grp_size == 2 else [(-0.6, -0.2), (0.0, 0.3), (0.6, -0.1)]
+        person_h_px = 16.0 * sc
+        for dx, dz in offsets:
+            px, py, psc = self._project(X + dx, Z + dz, w, h)
+            torso_top = py - person_h_px * 0.75
+            head_top = py - person_h_px
+            painter.setPen(QtGui.QPen(color, max(2.0, 3.2 * psc)))
+            painter.drawLine(QtCore.QPointF(px, py), QtCore.QPointF(px, torso_top))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QBrush(color))
+            painter.drawEllipse(QtCore.QPointF(px, head_top), max(2.5, 3.5 * psc), max(2.5, 3.5 * psc))
+
+        # Floating HUD Badge
+        badge_text = f"👥 Groupe ({grp_size} pers) • {Z:.1f}m"
+        font = QtGui.QFont("SF Pro Display", 9, QtGui.QFont.Bold)
+        painter.setFont(font)
+        fm = QtGui.QFontMetrics(font)
+        tw = fm.horizontalAdvance(badge_text)
+        th = fm.height()
+
+        bw = tw + 14
+        bh = th + 4
+        bx = gx - bw / 2.0
+        by = gy - person_h_px - 14
+
+        painter.setPen(QtGui.QPen(color, 1.2))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(10, 15, 24, 220)))
+        painter.drawRoundedRect(QtCore.QRectF(bx, by, bw, bh), 4.0, 4.0)
+
+        painter.setPen(QtGui.QColor("#ffffff"))
+        painter.drawText(int(bx + 7), int(by + th), badge_text)
+
 
     def _draw_3d_vehicle(
         self,

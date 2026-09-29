@@ -320,8 +320,16 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_snap.clicked.connect(self._on_take_snapshot)
         layout.addWidget(btn_snap)
 
+        # Settings Dialog Button
+        btn_settings = QtWidgets.QPushButton("⚙️ Réglages")
+        btn_settings.setStyleSheet(self._btn_style())
+        btn_settings.setToolTip("Ajuster le compromis Vitesse ↔ Précision et les cadences")
+        btn_settings.clicked.connect(self._on_open_settings)
+        layout.addWidget(btn_settings)
+
         # Webcam Button
         btn_webcam = QtWidgets.QPushButton("Webcam")
+
         btn_webcam.setStyleSheet(self._btn_style())
         btn_webcam.clicked.connect(lambda: self.worker.open_source(0))
         layout.addWidget(btn_webcam)
@@ -632,6 +640,163 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         """)
 
+    def _on_open_settings(self):
+        dlg = SettingsDialog(self.engine, parent=self)
+        dlg.exec()
+
     def closeEvent(self, event: QtGui.QCloseEvent):
         self.worker.stop()
         event.accept()
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    """Configuration Dialog for Performance, Cadence, and Calibration."""
+
+    def __init__(self, engine: PanopticPerceptionEngine, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ Réglages & Performance Car-Vision")
+        self.setFixedWidth(460)
+        self.engine = engine
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #0b1017;
+                color: #e2e8f0;
+            }
+            QLabel {
+                color: #94a3b8;
+                font-size: 11px;
+                font-weight: 500;
+            }
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #1e2638;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #0284c7;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: #ffffff;
+                width: 12px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 6px;
+            }
+            QCheckBox {
+                color: #e2e8f0;
+                font-size: 11px;
+                font-weight: 500;
+            }
+            QComboBox {
+                background-color: #161c28;
+                color: #e2e8f0;
+                border: 1px solid #283346;
+                border-radius: 5px;
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+        """)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(14)
+        layout.setContentsMargins(18, 18, 18, 18)
+
+        lbl_title = QtWidgets.QLabel("PARAMÈTRES DE PERFORMANCE & PERCEPTION")
+        lbl_title.setStyleSheet("font-size: 11px; font-weight: 800; color: #38bdf8; letter-spacing: 1px;")
+        layout.addWidget(lbl_title)
+
+        # 1. Compromis Vitesse / Précision
+        group_perf = QtWidgets.QGroupBox("Compromis ⚡ Vitesse ↔ 🎯 Précision")
+        group_perf.setStyleSheet("QGroupBox { font-size: 11px; font-weight: 700; color: #ffffff; border: 1px solid #1e293b; border-radius: 6px; margin-top: 10px; padding-top: 14px; }")
+        perf_layout = QtWidgets.QVBoxLayout(group_perf)
+
+        self.lbl_perf_desc = QtWidgets.QLabel(f"Résolution imgsz={self.engine.imgsz}px • Cadence={self.engine.yolop_cadence}")
+        self.lbl_perf_desc.setStyleSheet("color: #38bdf8; font-weight: 600;")
+        perf_layout.addWidget(self.lbl_perf_desc)
+
+        self.slider_perf = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_perf.setRange(0, 100)
+        init_val = 50 if self.engine.imgsz == 576 else (20 if self.engine.imgsz == 480 else 80)
+        self.slider_perf.setValue(init_val)
+        self.slider_perf.valueChanged.connect(self._on_perf_changed)
+        perf_layout.addWidget(self.slider_perf)
+
+        layout.addWidget(group_perf)
+
+        # 2. Cadence YOLOPv2
+        cad_layout = QtWidgets.QHBoxLayout()
+        lbl_cad = QtWidgets.QLabel("Cadence Segmentation (YOLOPv2) :")
+        self.combo_cadence = QtWidgets.QComboBox()
+        self.combo_cadence.addItems([
+            "1 frame sur 1 (Maximale)",
+            "1 frame sur 2 (Rapide)",
+            "1 frame sur 3 (Recommandé • +60% FPS)",
+            "1 frame sur 4 (Ultra-Rapide)"
+        ])
+        cad_idx = {1: 0, 2: 1, 3: 2, 4: 3}.get(self.engine.yolop_cadence, 2)
+        self.combo_cadence.setCurrentIndex(cad_idx)
+        self.combo_cadence.currentIndexChanged.connect(self._on_cadence_changed)
+        cad_layout.addWidget(lbl_cad)
+        cad_layout.addWidget(self.combo_cadence)
+        layout.addLayout(cad_layout)
+
+        # 3. Regroupement Piétons
+        self.chk_ped_group = QtWidgets.QCheckBox("Regrouper les piétons marchant ensemble (Polygone convexe)")
+        self.chk_ped_group.setChecked(self.engine.enable_pedestrian_grouping)
+        self.chk_ped_group.toggled.connect(self._on_ped_group_toggled)
+        layout.addWidget(self.chk_ped_group)
+
+        # 4. Calibrage Caméra
+        group_cam = QtWidgets.QGroupBox("Calibrage Caméra")
+        group_cam.setStyleSheet("QGroupBox { font-size: 11px; font-weight: 700; color: #ffffff; border: 1px solid #1e293b; border-radius: 6px; margin-top: 10px; padding-top: 14px; }")
+        cam_layout = QtWidgets.QVBoxLayout(group_cam)
+
+        self.lbl_cam_h = QtWidgets.QLabel(f"Hauteur de caméra : {self.engine.geom.cam_h:.2f} m")
+        cam_layout.addWidget(self.lbl_cam_h)
+        self.slider_cam_h = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_cam_h.setRange(80, 250)
+        self.slider_cam_h.setValue(int(self.engine.geom.cam_h * 100))
+        self.slider_cam_h.valueChanged.connect(self._on_cam_h_changed)
+        cam_layout.addWidget(self.slider_cam_h)
+
+        layout.addWidget(group_cam)
+
+        # Close button
+        btn_close = QtWidgets.QPushButton("Appliquer & Fermer")
+        btn_close.setStyleSheet("""
+            QPushButton {
+                background-color: #0284c7;
+                color: #ffffff;
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: #0369a1; }
+        """)
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def _on_perf_changed(self, val: int):
+        level = val / 100.0
+        self.engine.set_performance_level(level)
+        if level <= 0.33:
+            self.lbl_perf_desc.setText(f"Mode ⚡ Vitesse Maximale (imgsz={self.engine.imgsz}px, Cadence={self.engine.yolop_cadence})")
+        elif level <= 0.66:
+            self.lbl_perf_desc.setText(f"Mode ⚖️ Équilibré (imgsz={self.engine.imgsz}px, Cadence={self.engine.yolop_cadence})")
+        else:
+            self.lbl_perf_desc.setText(f"Mode 🎯 Précision Maximale (imgsz={self.engine.imgsz}px, Cadence={self.engine.yolop_cadence})")
+
+    def _on_cadence_changed(self, idx: int):
+        cadences = [1, 2, 3, 4]
+        self.engine.yolop_cadence = cadences[idx]
+        self.engine.vo_cadence = cadences[idx]
+
+    def _on_ped_group_toggled(self, checked: bool):
+        self.engine.enable_pedestrian_grouping = checked
+
+    def _on_cam_h_changed(self, val: int):
+        h_m = val / 100.0
+        self.lbl_cam_h.setText(f"Hauteur de caméra : {h_m:.2f} m")
+        self.engine.geom.set_camera_parameters(cam_height=h_m)
+

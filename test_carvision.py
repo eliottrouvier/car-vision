@@ -17,7 +17,7 @@ from perception_engine import PanopticPerceptionEngine
 
 
 def test_bev_geometry_hybrid_depth():
-    print("[TEST 1/6] Testing BEV Geometry & Robust Hybrid Depth Estimator...")
+    print("[TEST 1/7] Testing BEV Geometry & Robust Hybrid Depth Estimator...")
     geom = BEVGeometry(1280, 720, cam_height=1.35, pitch_deg=4.2, fov_deg=65.0)
 
     # 1. Close vehicle contact point
@@ -40,7 +40,7 @@ def test_bev_geometry_hybrid_depth():
 
 
 def test_tracker_kalman_and_one_euro():
-    print("[TEST 2/6] Testing 3D Kalman Filter, 1€ Filter & Multi-Object Tracking...")
+    print("[TEST 2/7] Testing 3D Kalman Filter, 1€ Filter & Multi-Object Tracking...")
     geom = BEVGeometry(1280, 720)
     tracker = CarVisionTracker(max_missed=6, metric_dist_thresh=5.0)
 
@@ -80,7 +80,7 @@ def test_tracker_kalman_and_one_euro():
 
 
 def test_samples_all():
-    print("[TEST 3/6] Testing All Sample Driving Videos Opening & Decoding...")
+    print("[TEST 3/7] Testing All Sample Driving Videos Opening & Decoding...")
     sample_files = ["city_paris.mp4", "highway.mp4", "car-detection.mp4", "person-bicycle-car-detection.mp4"]
     for s in sample_files:
         path = os.path.join("samples", s)
@@ -97,7 +97,7 @@ def test_samples_all():
 
 
 def test_perception_engine_paris():
-    print("[TEST 4/6] Testing Panoptic Perception Engine on Paris City Traffic (MPS GPU)...")
+    print("[TEST 4/7] Testing Panoptic Perception Engine on Paris City Traffic (MPS GPU)...")
     engine = PanopticPerceptionEngine(yolo_actor_weights="yolo11s.pt")
     assert engine.device.type == 'mps', f"Expected Apple Silicon MPS device, got {engine.device.type}"
 
@@ -114,7 +114,7 @@ def test_perception_engine_paris():
 
 
 def test_drivable_road_carpet_unprojection():
-    print("[TEST 5/6] Testing Drivable Road Surface 3D Polygon Extraction...")
+    print("[TEST 5/7] Testing Drivable Road Surface 3D Polygon Extraction...")
     engine = PanopticPerceptionEngine()
 
     cap = cv2.VideoCapture("samples/highway.mp4")
@@ -130,7 +130,7 @@ def test_drivable_road_carpet_unprojection():
 
 
 def test_model_switching():
-    print("[TEST 6/6] Testing Dynamic YOLO Model Switching (s -> m -> n)...")
+    print("[TEST 6/7] Testing Dynamic YOLO Model Switching (s -> m -> n)...")
     engine = PanopticPerceptionEngine(yolo_actor_weights="yolo11s.pt")
     assert engine.actor_model_name == "yolo11s.pt"
 
@@ -142,6 +142,59 @@ def test_model_switching():
     print("  -> Model Switching PASSED.")
 
 
+def test_pedestrian_clustering_and_cadence():
+    print("[TEST 7/7] Testing Pedestrian Crowd Clustering & Cadence Caching...")
+    engine = PanopticPerceptionEngine()
+
+    # 1. Test crowd clustering logic
+    mock_detections = [
+        {
+            'box_2d': [500, 350, 530, 430],
+            'class_name': 'person',
+            'confidence': 0.85,
+            'pos_3d': (1.0, 12.0),
+            'corners_3d': np.zeros((8, 3))
+        },
+        {
+            'box_2d': [525, 352, 555, 432],
+            'class_name': 'person',
+            'confidence': 0.82,
+            'pos_3d': (1.4, 12.2),
+            'corners_3d': np.zeros((8, 3))
+        },
+        {
+            'box_2d': [300, 320, 420, 410],
+            'class_name': 'car',
+            'confidence': 0.91,
+            'pos_3d': (-3.0, 18.0),
+            'corners_3d': np.zeros((8, 3))
+        }
+    ]
+
+    merged, groups = engine._cluster_pedestrians(mock_detections)
+    assert len(groups) == 1, f"Expected 1 pedestrian group, got {len(groups)}"
+    assert groups[0]['group_size'] == 2, f"Expected group size 2, got {groups[0]['group_size']}"
+    assert groups[0]['class_name'] == 'person_group'
+    assert len(merged) == 2, f"Expected 2 merged detections (1 car + 1 person_group), got {len(merged)}"
+
+    # 2. Test cadence caching
+    cap = cv2.VideoCapture("samples/city_paris.mp4")
+    ret, frame = cap.read()
+    cap.release()
+    assert ret, "Failed to read test frame"
+
+    # Frame 1: Full inference
+    res1 = engine.process_frame(frame)
+    # Frame 2 & 3: Cadence cached frames
+    res2 = engine.process_frame(frame)
+    res3 = engine.process_frame(frame)
+
+    assert res2.drivable_mask is not None and res2.lane_mask is not None
+    assert res2.bev_carpet_3d is not None
+    assert res2.inference_time_ms < res1.inference_time_ms * 0.8 or res2.inference_time_ms < 50.0
+    print(f"  -> Pedestrian Clustering & Cadence PASSED. Frame 1: {res1.inference_time_ms:.1f}ms, Frame 2 (cached): {res2.inference_time_ms:.1f}ms")
+
+
 if __name__ == "__main__":
     print("=== Starting Car-Vision Comprehensive Test Suite ===")
     t_start = time.time()
@@ -151,4 +204,5 @@ if __name__ == "__main__":
     test_perception_engine_paris()
     test_drivable_road_carpet_unprojection()
     test_model_switching()
-    print(f"=== ALL 6 TESTS PASSED in {time.time() - t_start:.2f}s ===")
+    test_pedestrian_clustering_and_cadence()
+    print(f"=== ALL 7 TESTS PASSED in {time.time() - t_start:.2f}s ===")

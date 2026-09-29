@@ -15,8 +15,10 @@ CLASS_3D_DIMENSIONS = {
     'motorcycle': (0.80, 2.10, 1.30),
     'bicycle': (0.60, 1.75, 1.35),
     'person': (0.65, 0.50, 1.75),
+    'person_group': (2.40, 2.40, 1.75),
     'default': (1.80, 4.50, 1.50)
 }
+
 
 
 class BEVGeometry:
@@ -260,25 +262,34 @@ class BEVGeometry:
     def unproject_lane_mask(
         self,
         lane_mask: np.ndarray,
-        step: int = 5,
+        step: int = 12,
         z_max: float = 85.0
     ) -> List[Tuple[float, float]]:
         """
         Extracts lane points from binary mask and projects to 3D ground coordinates (X, Z).
+        Vectorized with NumPy for sub-millisecond execution.
         """
         v_coords, u_coords = np.where(lane_mask > 0)
         if len(v_coords) == 0:
             return []
 
-        pts_3d = []
-        indices = np.arange(0, len(v_coords), step)
-        for idx in indices:
-            u, v = u_coords[idx], v_coords[idx]
-            X, Z = self.image_to_ground(float(u), float(v))
-            if X is not None and Z is not None and 1.0 <= Z <= z_max:
-                pts_3d.append((X, Z))
+        u_sub = u_coords[::step].astype(np.float32)
+        v_sub = v_coords[::step].astype(np.float32)
 
-        return pts_3d
+        m_v = (v_sub - self.cy) / self.fy
+        m_u = (u_sub - self.cx) / self.fx
+        denom = np.sin(self.pitch) + m_v * np.cos(self.pitch)
+
+        valid = (denom > 0.005)
+        safe_denom = np.maximum(denom, 0.005)
+        Z = np.where(valid, self.cam_h * (np.cos(self.pitch) - m_v * np.sin(self.pitch)) / safe_denom, 0.0)
+        valid_z = valid & (Z >= 1.0) & (Z <= z_max)
+
+        Z_cam = self.cam_h * np.sin(self.pitch) + Z * np.cos(self.pitch)
+        X = m_u * Z_cam
+
+        return list(zip(X[valid_z].tolist(), Z[valid_z].tolist()))
+
 
     def unproject_road_polygon(
         self,

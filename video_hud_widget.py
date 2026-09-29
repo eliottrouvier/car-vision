@@ -229,10 +229,22 @@ class VideoHUDWidget(QtWidgets.QWidget):
             color = QtGui.QColor(245, 158, 11) # Amber Gold
         elif is_hovered:
             color = QtGui.QColor(0, 245, 255)  # Electric Cyan
-        elif trk.class_name == 'person':
-            color = QtGui.QColor(255, 90, 130) # Coral
+        elif trk.class_name in ('person', 'person_group'):
+            color = QtGui.QColor(255, 95, 135) # Coral Pink
         else:
             color = QtGui.QColor(56, 189, 248)  # Sky Blue
+
+        # Draw semi-transparent convex hull for pedestrian groups
+        if trk.class_name == 'person_group' and self.current_result:
+            for grp in self.current_result.pedestrian_groups:
+                dist = math.hypot(grp['pos_3d'][0] - trk.X, grp['pos_3d'][1] - trk.Z)
+                if dist < 2.0 and 'hull_2d' in grp and len(grp['hull_2d']) >= 3:
+                    hull_screen = [QtCore.QPointF(*to_widget(pt[0], pt[1])) for pt in grp['hull_2d']]
+                    poly = QtGui.QPolygonF(hull_screen)
+                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 95, 135, 220), 1.8, QtCore.Qt.DashLine))
+                    painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 95, 135, 45)))
+                    painter.drawPolygon(poly)
+                    break
 
         line_w = 2.4 if (is_hovered or is_lead) else 1.8
         pen = QtGui.QPen(color, line_w)
@@ -273,10 +285,19 @@ class VideoHUDWidget(QtWidgets.QWidget):
 
         # Bottom distance tag capsule
         fr_name = FRENCH_CLASSES.get(trk.class_name, trk.class_name.capitalize())
-        if is_lead:
+        if trk.class_name == 'person_group':
+            grp_cnt = 2
+            if self.current_result:
+                for grp in self.current_result.pedestrian_groups:
+                    if math.hypot(grp['pos_3d'][0] - trk.X, grp['pos_3d'][1] - trk.Z) < 2.0:
+                        grp_cnt = grp.get('group_size', 2)
+                        break
+            tag_text = f"👥 Groupe ({grp_cnt} pers) • {trk.Z:.1f}m"
+        elif is_lead:
             tag_text = f"★ LEAD #{trk.track_id} • {trk.Z:.1f}m"
         else:
             tag_text = f"#{trk.track_id} {fr_name} • {trk.Z:.1f}m"
+
 
         font = QtGui.QFont("SF Pro Display", 9, QtGui.QFont.Bold)
         painter.setFont(font)
