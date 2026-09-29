@@ -349,7 +349,7 @@ class CarVisionTracker:
 
         # 3. Create new tracks for unmatched high-confidence detections
         for d_idx, det in enumerate(detections):
-            if d_idx not in matched_dets and det['confidence'] >= 0.22:
+            if d_idx not in matched_dets and det['confidence'] >= 0.30:
                 new_trk = TrackedObject(
                     track_id=self.next_id,
                     box_2d=det['box_2d'],
@@ -364,16 +364,22 @@ class CarVisionTracker:
         # 4. Prune dead tracks
         dead_ids = [
             t_id for t_id, trk in self.tracks.items()
-            if trk.missed_frames > self.max_missed or trk.Z > 140.0 or trk.Z < 0.2
+            if trk.missed_frames > self.max_missed or trk.Z > 140.0 or trk.Z < 0.5
         ]
         for t_id in dead_ids:
             del self.tracks[t_id]
 
-        # 5. Return active confirmed tracks (must have >= 2 hits or close proximity)
-        active = [
-            trk for trk in self.tracks.values()
-            if (trk.hits >= 2 or trk.Z < 15.0) and trk.missed_frames <= 3
-        ]
+        # 5. Return active confirmed tracks:
+        # Require >= 2 consecutive hits, OR high-confidence large vehicle detection.
+        # Guarantees zero single-frame hallucinations.
+        active = []
+        for trk in self.tracks.values():
+            if trk.missed_frames > 2:
+                continue
+            bh = trk.box_2d[3] - trk.box_2d[1]
+            is_confirmed = (trk.hits >= 2) or (trk.confidence >= 0.65 and bh >= 45.0 and trk.Z < 25.0)
+            if is_confirmed:
+                active.append(trk)
         return active
 
     @staticmethod

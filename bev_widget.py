@@ -173,61 +173,66 @@ class BEVWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.TextAntialiasing)
 
-        w = self.width()
-        h = self.height()
-        self._actor_screen_positions.clear()
+            w = self.width()
+            h = self.height()
+            self._actor_screen_positions.clear()
 
-        is_moving = self.current_result.is_camera_moving if self.current_result else True
-        ego_speed = self.current_result.ego_speed_estimate if self.current_result else 0.0
+            is_moving = self.current_result.is_camera_moving if self.current_result else True
+            ego_speed = self.current_result.ego_speed_estimate if self.current_result else 0.0
 
-        # 1. Dark titanium space gradient background
-        bg_grad = QtGui.QRadialGradient(w / 2.0, h * 0.65, max(w, h))
-        bg_grad.setColorAt(0.0, QtGui.QColor("#0d131c"))
-        bg_grad.setColorAt(0.7, QtGui.QColor("#070a10"))
-        bg_grad.setColorAt(1.0, QtGui.QColor("#040609"))
-        painter.fillRect(0, 0, w, h, QtGui.QBrush(bg_grad))
+            # 1. Dark titanium space gradient background
+            bg_grad = QtGui.QRadialGradient(w / 2.0, h * 0.65, max(w, h))
+            bg_grad.setColorAt(0.0, QtGui.QColor("#0d131c"))
+            bg_grad.setColorAt(0.7, QtGui.QColor("#070a10"))
+            bg_grad.setColorAt(1.0, QtGui.QColor("#040609"))
+            painter.fillRect(0, 0, w, h, QtGui.QBrush(bg_grad))
 
-        # 2. Road surface & Radar Rings
-        if is_moving:
-            self._draw_dynamic_asphalt_road(painter, w, h)
-            self._draw_radar_rings(painter, w, h)
-        else:
-            self._draw_fixed_street_grid(painter, w, h)
+            # 2. Road surface & Radar Rings
+            if is_moving:
+                self._draw_dynamic_asphalt_road(painter, w, h)
+                self._draw_radar_rings(painter, w, h)
+            else:
+                self._draw_fixed_street_grid(painter, w, h)
 
-        # 3. Faithful Drivable Road Polygon from YOLOPv2
-        if self.current_result and self.current_result.bev_carpet_3d:
-            self._draw_drivable_road_carpet(painter, w, h)
+            # 3. Faithful Drivable Road Polygon from YOLOPv2
+            if self.current_result and self.current_result.bev_carpet_3d:
+                self._draw_drivable_road_carpet(painter, w, h)
 
-        # 4. Projected 3D Lanes
-        if self.current_result and self.current_result.bev_lanes_3d:
-            self._draw_panoptic_lanes(painter, w, h)
+            # 4. Projected 3D Lanes
+            if self.current_result and self.current_result.bev_lanes_3d:
+                self._draw_panoptic_lanes(painter, w, h)
 
-        # 5. Projected Crosswalks
-        if self.current_result and self.current_result.crosswalks:
-            self._draw_crosswalks(painter, w, h)
+            # 5. Projected Crosswalks
+            if self.current_result and self.current_result.crosswalks:
+                self._draw_crosswalks(painter, w, h)
 
-        # 6. Trajectory Corridor (Driving Path Ribbon)
-        if self.current_result:
-            self._draw_trajectory_corridor(painter, w, h)
+            # 6. Trajectory Corridor (Driving Path Ribbon)
+            if self.current_result:
+                self._draw_trajectory_corridor(painter, w, h)
 
-        # 7. Ego Host Vehicle
-        if is_moving:
-            self._draw_ego_vehicle(painter, w, h)
-        else:
-            self._draw_fixed_camera_origin(painter, w, h)
+            # 7. Ego Host Vehicle
+            if is_moving:
+                self._draw_ego_vehicle(painter, w, h)
+            else:
+                self._draw_fixed_camera_origin(painter, w, h)
 
-        # 8. Surrounding Tracked 3D Actors (Vehicles, Pedestrians, Cyclists)
-        if self.current_result is not None:
-            # Sort tracks back-to-front (largest Z first) for correct depth rendering
-            sorted_tracks = sorted(self.current_result.tracks, key=lambda t: t.Z, reverse=True)
-            for trk in sorted_tracks:
-                self._draw_3d_actor(painter, trk, w, h, is_moving)
+            # 8. Surrounding Tracked 3D Actors (Vehicles, Pedestrians, Cyclists)
+            if self.current_result is not None:
+                # Sort tracks back-to-front (largest Z first) for correct depth rendering
+                sorted_tracks = sorted(self.current_result.tracks, key=lambda t: t.Z, reverse=True)
+                for trk in sorted_tracks:
+                    self._draw_3d_actor(painter, trk, w, h, is_moving)
 
-        # 9. Reference Frame Badge & Minimalist HUD
-        self._draw_hud_overlay(painter, w, h, is_moving, ego_speed)
+            # 9. Reference Frame Badge & Minimalist HUD
+            self._draw_hud_overlay(painter, w, h, is_moving, ego_speed)
+        except Exception as e:
+            pass
+        finally:
+            painter.end()
 
     def _draw_dynamic_asphalt_road(self, painter: QtGui.QPainter, w: int, h: int):
         """Draws living road ribbon with moving dashed lines."""

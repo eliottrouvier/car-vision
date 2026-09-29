@@ -34,7 +34,7 @@ class BEVGeometry:
         img_w: int = 1280,
         img_h: int = 720,
         cam_height: float = 1.35,      # Camera height above asphalt in meters
-        pitch_deg: float = 4.2,         # Downward tilt angle relative to horizon
+        pitch_deg: float = -4.5,        # Horizon calibrated for dashcam (~0.60 * h)
         yaw_deg: float = 0.0,           # Azimuth angle relative to car centerline
         fov_deg: float = 65.0           # Horizontal field of view in degrees
     ):
@@ -55,8 +55,8 @@ class BEVGeometry:
         self.cx = self.w / 2.0
         self.cy = self.h / 2.0
 
-        # In camera frame where +Y is down, tilting the camera DOWN (pitch > 0)
-        # shifts the horizon ABOVE the optical center: v_horizon = cy - fy * tan(pitch)
+        # In camera frame where +Y is down:
+        # Tilting camera slightly UP or forward shifts horizon: v_horizon = cy - fy * tan(pitch)
         self.v_horizon = self.cy - self.fy * np.tan(self.pitch)
 
     def update_resolution(self, img_w: int, img_h: int):
@@ -87,8 +87,8 @@ class BEVGeometry:
         measured_pitch = np.arctan2(self.cy - vp_v, self.fy)
         measured_yaw = np.arctan2(vp_u - self.cx, self.fx)
 
-        # Clamped smoothing to maintain rock-solid stability
-        measured_pitch = float(np.clip(measured_pitch, np.radians(0.5), np.radians(14.0)))
+        # Clamped smoothing to maintain rock-solid stability (allow natural dashcam pitch)
+        measured_pitch = float(np.clip(measured_pitch, np.radians(-9.0), np.radians(4.0)))
         measured_yaw = float(np.clip(measured_yaw, np.radians(-8.0), np.radians(8.0)))
 
         self.pitch = smoothing * self.pitch + (1.0 - smoothing) * measured_pitch
@@ -174,16 +174,25 @@ class BEVGeometry:
         # 2. Ground contact IPM unprojection
         X_ipm, Z_ipm = self.image_to_ground(u_bot, v_bot)
 
-        # 3. Dynamic Bayesian weighting based on vertical distance to horizon
+        # 3. Dynamic Bayesian Consensus Weighting
         v_margin = v_bot - self.v_horizon
-        if Z_ipm is None or v_margin <= 5.0:
-            # Too close to or above horizon: trust height prior
+        if Z_ipm is None or v_margin <= 8.0:
             Z_fused = Z_prior
         else:
-            # Sigmoid weight: 1.0 when clearly in road foreground, 0.0 near horizon
-            w_ipm = 1.0 / (1.0 + np.exp(-(v_margin - 35.0) / 12.0))
-            w_ipm = float(np.clip(w_ipm, 0.05, 0.95))
-            Z_fused = w_ipm * Z_ipm + (1.0 - w_ipm) * Z_prior
+            discrepancy = abs(Z_ipm - Z_prior) / max(Z_prior, 1.0)
+            if discrepancy > 0.40:
+                # Strong divergence: trust height prior to prevent ghost/teleporting vehicles
+                Z_fused = 0.80 * Z_prior + 0.20 * Z_ipm
+            else:
+                # Balanced consensus between IPM contact and optical height prior
+                w_ipm = float(np.clip((v_margin - 10.0) / 80.0, 0.20, 0.60))
+                Z_fused = w_ipm * Z_ipm + (1.0 - w_ipm) * Z_prior
+
+        # Physical plausibility enforcement:
+        # A tiny box for a vehicle cannot physically be in the immediate front bumper zone
+        if class_name in ('car', 'truck', 'bus') and h_box_px < 32.0:
+            min_possible_z = (self.fy * h_real) / 36.0
+            Z_fused = max(Z_fused, min_possible_z)
 
         Z_fused = float(np.clip(Z_fused, 1.0, 150.0))
 

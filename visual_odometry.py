@@ -35,6 +35,15 @@ class VisualOdometry:
         # Moving threshold in pixels/frame
         self.motion_threshold = 0.65
 
+    def reset(self):
+        """Resets optical flow tracking state on video switch or seek."""
+        self.prev_gray = None
+        self.feature_pts = None
+        self.flow_magnitudes.clear()
+        self.vertical_flows.clear()
+        self.foe_u = None
+        self.foe_v = None
+
     def update(
         self,
         frame: np.ndarray,
@@ -51,8 +60,11 @@ class VisualOdometry:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
 
-        if self.prev_gray is None:
+        if self.prev_gray is None or self.prev_gray.shape != gray.shape:
             self.prev_gray = gray
+            self.feature_pts = None
+            self.flow_magnitudes.clear()
+            self.vertical_flows.clear()
             self._detect_features(gray, actor_boxes)
             return self.is_camera_moving, self.ego_speed_kmh, None
 
@@ -62,16 +74,21 @@ class VisualOdometry:
                 self.prev_gray = gray
                 return self.is_camera_moving, self.ego_speed_kmh, None
 
-        # Lucas-Kanade Sparse Optical Flow
-        p1, st, err = cv2.calcOpticalFlowPyrLK(
-            self.prev_gray,
-            gray,
-            self.feature_pts,
-            None,
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03)
-        )
+        # Lucas-Kanade Sparse Optical Flow with try/except protection
+        try:
+            p1, st, err = cv2.calcOpticalFlowPyrLK(
+                self.prev_gray,
+                gray,
+                self.feature_pts,
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03)
+            )
+        except Exception:
+            self.reset()
+            self.prev_gray = gray
+            return self.is_camera_moving, self.ego_speed_kmh, None
 
         if p1 is not None and st is not None:
             good_p0 = self.feature_pts[st.flatten() == 1]

@@ -18,12 +18,12 @@ from perception_engine import PanopticPerceptionEngine
 
 def test_bev_geometry_hybrid_depth():
     print("[TEST 1/7] Testing BEV Geometry & Robust Hybrid Depth Estimator...")
-    geom = BEVGeometry(1280, 720, cam_height=1.35, pitch_deg=4.2, fov_deg=65.0)
+    geom = BEVGeometry(1280, 720, cam_height=1.35, pitch_deg=-4.5, fov_deg=65.0)
 
     # 1. Close vehicle contact point
-    X, Z = geom.image_to_ground(640, 520)
+    X, Z = geom.image_to_ground(640, 560)
     assert X is not None and Z is not None, "Failed to unproject valid image point"
-    assert 2.0 <= Z <= 15.0, f"Unexpected distance for foreground car: {Z:.2f}m"
+    assert 4.0 <= Z <= 20.0, f"Unexpected distance for foreground car: {Z:.2f}m"
 
     # 2. Hybrid depth estimation on distant car near horizon
     box_distant = [600, 310, 680, 335] # box height = 25px
@@ -102,15 +102,17 @@ def test_perception_engine_paris():
     assert engine.device.type == 'mps', f"Expected Apple Silicon MPS device, got {engine.device.type}"
 
     cap = cv2.VideoCapture("samples/city_paris.mp4")
-    ret, frame = cap.read()
+    ret1, f1 = cap.read()
+    ret2, f2 = cap.read()
     cap.release()
-    assert ret, "Failed to read city_paris.mp4 frame"
+    assert ret1 and ret2, "Failed to read city_paris.mp4 frames"
 
-    res = engine.process_frame(frame)
+    res1 = engine.process_frame(f1)
+    res = engine.process_frame(f2)
     assert res.drivable_mask is not None, "Drivable mask missing"
     assert res.lane_mask is not None, "Lane mask missing"
     assert len(res.tracks) >= 3, f"Expected multiple urban actors detected, got {len(res.tracks)}"
-    print(f"  -> Paris City Perception PASSED. Inference: {res.inference_time_ms:.1f} ms, Detected {len(res.tracks)} actors.")
+    print(f"  -> Paris City Perception PASSED. Inference: {res.inference_time_ms:.1f} ms, Confirmed {len(res.tracks)} actors.")
 
 
 def test_drivable_road_carpet_unprojection():

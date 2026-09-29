@@ -5,6 +5,7 @@ pedestrian/vehicle distance badges, and interactive hover synchronization.
 """
 
 from typing import Optional, List, Tuple, Dict
+import math
 import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -59,12 +60,46 @@ class VideoHUDWidget(QtWidgets.QWidget):
         # Box screen mappings: track_id -> [sx1, sy1, sx2, sy2]
         self._screen_boxes: Dict[int, List[float]] = {}
 
+        # Cached display QImage
+        self._cached_qimage: Optional[QtGui.QImage] = None
+        self._cached_rgb_buffer: Optional[np.ndarray] = None
+
         self.setMouseTracking(True)
+
+    def _prepare_display_image(self, frame: np.ndarray, result: Optional[PerceptionResult]):
+        """Pre-renders video frame with road carpet and lanes to QImage once per frame."""
+        display_img = frame.copy()
+
+        # 1. Drivable Road Carpet Overlay
+        if self.show_drivable_carpet and result is not None:
+            da_mask = result.drivable_mask
+            if da_mask is not None and da_mask.any():
+                overlay = display_img.copy()
+                overlay[da_mask > 0] = [170, 225, 50] # Glowing cyan-green
+                cv2.addWeighted(overlay, 0.22, display_img, 0.78, 0, display_img)
+
+        # 2. Lane Lines Overlay
+        if self.show_lane_lines and result is not None:
+            lane_mask = result.lane_mask
+            if lane_mask is not None and lane_mask.any():
+                display_img[lane_mask > 0] = [255, 230, 0] # Electric yellow/cyan
+
+        # Store contiguous RGB buffer
+        self._cached_rgb_buffer = np.ascontiguousarray(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB))
+        fh, fw = self._cached_rgb_buffer.shape[:2]
+        self._cached_qimage = QtGui.QImage(
+            self._cached_rgb_buffer.data,
+            fw,
+            fh,
+            fw * 3,
+            QtGui.QImage.Format_RGB888
+        )
 
     def update_frame(self, frame: np.ndarray, result: PerceptionResult, geom: BEVGeometry):
         self.current_frame = frame
         self.current_result = result
         self.geom = geom
+        self._prepare_display_image(frame, result)
         self.update()
 
     def set_box_mode(self, mode: str):
@@ -105,79 +140,57 @@ class VideoHUDWidget(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
 
-        w_widget = self.width()
-        h_widget = self.height()
-        self._screen_boxes.clear()
+            w_widget = self.width()
+            h_widget = self.height()
+            self._screen_boxes.clear()
 
-        if self.current_frame is None:
-            painter.fillRect(0, 0, w_widget, h_widget, QtGui.QColor("#080b0f"))
-            painter.setPen(QtGui.QColor("#64748b"))
-            painter.setFont(QtGui.QFont("SF Pro Display", 13, QtGui.QFont.Medium))
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "AUCUN SIGNAL VIDÉO")
-            return
+            if self._cached_qimage is None or self.current_frame is None:
+                painter.fillRect(0, 0, w_widget, h_widget, QtGui.QColor("#080b0f"))
+                painter.setPen(QtGui.QColor("#64748b"))
+                painter.setFont(QtGui.QFont("SF Pro Display", 13, QtGui.QFont.Medium))
+                painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "AUCUN SIGNAL VIDÉO")
+                return
 
-        frame = self.current_frame
-        fh, fw = frame.shape[:2]
+            fh, fw = self.current_frame.shape[:2]
+            scale = min(w_widget / fw, h_widget / fh)
+            dw = int(fw * scale)
+            dh = int(fh * scale)
+            dx = (w_widget - dw) // 2
+            dy = (h_widget - dh) // 2
 
-        scale = min(w_widget / fw, h_widget / fh)
-        dw = int(fw * scale)
-        dh = int(fh * scale)
-        dx = (w_widget - dw) // 2
-        dy = (h_widget - dh) // 2
+            target_rect = QtCore.QRect(dx, dy, dw, dh)
+            painter.drawImage(target_rect, self._cached_qimage)
 
-        display_img = frame.copy()
+            # Coordinate transform from frame pixels to widget coordinates:
+            def to_widget(x: float, y: float) -> Tuple[float, float]:
+                return dx + x * scale, dy + y * scale
 
-        # 1. Drivable Road Carpet Overlay
-        if self.show_drivable_carpet and self.current_result is not None:
-            da_mask = self.current_result.drivable_mask
-            if da_mask is not None and da_mask.max() > 0:
-                overlay = display_img.copy()
-                overlay[da_mask > 0] = [170, 225, 50] # Glowing cyan-green
-                cv2.addWeighted(overlay, 0.22, display_img, 0.78, 0, display_img)
+            # 3. Horizon line (if enabled)
+            if self.show_horizon and self.current_result is not None:
+                _, hy = to_widget(0, self.current_result.horizon_y)
+                painter.setPen(QtGui.QPen(QtGui.QColor(0, 230, 255, 90), 1.0, QtCore.Qt.DashLine))
+                painter.drawLine(QtCore.QPointF(dx, hy), QtCore.QPointF(dx + dw, hy))
 
-        # 2. Lane Lines Overlay
-        if self.show_lane_lines and self.current_result is not None:
-            lane_mask = self.current_result.lane_mask
-            if lane_mask is not None and lane_mask.max() > 0:
-                display_img[lane_mask > 0] = [255, 230, 0] # Electric yellow/cyan
+            # 4. Trajectory Corridor Road Projection
+            if self.current_result and self.geom:
+                self._draw_road_trajectory_corridor(painter, to_widget)
 
-        # Convert to QImage and draw
-        display_rgb = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
-        qimg = QtGui.QImage(
-            display_rgb.data,
-            fw,
-            fh,
-            fw * 3,
-            QtGui.QImage.Format_RGB888
-        )
-        target_rect = QtCore.QRect(dx, dy, dw, dh)
-        painter.drawImage(target_rect, qimg)
+            # 5. Actors Bounding Boxes & Distance Badges
+            if self.show_boxes and self.current_result is not None:
+                for trk in self.current_result.tracks:
+                    self._draw_actor_hud(painter, trk, to_widget)
 
-        # Coordinate transform from frame pixels to widget coordinates:
-        def to_widget(x: float, y: float) -> Tuple[float, float]:
-            return dx + x * scale, dy + y * scale
-
-        # 3. Horizon line (if enabled)
-        if self.show_horizon and self.current_result is not None:
-            _, hy = to_widget(0, self.current_result.horizon_y)
-            painter.setPen(QtGui.QPen(QtGui.QColor(0, 230, 255, 90), 1.0, QtCore.Qt.DashLine))
-            painter.drawLine(QtCore.QPointF(dx, hy), QtCore.QPointF(dx + dw, hy))
-
-        # 4. Trajectory Corridor Road Projection
-        if self.current_result and self.geom:
-            self._draw_road_trajectory_corridor(painter, to_widget)
-
-        # 5. Actors Bounding Boxes & Distance Badges
-        if self.show_boxes and self.current_result is not None:
-            for trk in self.current_result.tracks:
-                self._draw_actor_hud(painter, trk, to_widget)
-
-        # 6. Forward Collision Warning Flash Banner
-        if self.current_result and self.current_result.fcw_alert:
-            self._draw_fcw_alert(painter, dx, dy, dw, dh)
+            # 6. Forward Collision Warning Flash Banner
+            if self.current_result and self.current_result.fcw_alert:
+                self._draw_fcw_alert(painter, dx, dy, dw, dh)
+        except Exception as e:
+            pass
+        finally:
+            painter.end()
 
     def _draw_road_trajectory_corridor(self, painter: QtGui.QPainter, to_widget):
         """Draws projected trajectory corridor onto the 2D video road."""

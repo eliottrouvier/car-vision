@@ -50,11 +50,13 @@ class VideoProcessingThread(QtCore.QThread):
         self.total_frames = 0
         self.current_frame_idx = 0
         self.loop_video = True
+        self.gui_busy = False
 
     def open_source(self, source_path_or_idx):
         """Thread-safe request to switch video source."""
         with QtCore.QMutexLocker(self.mutex):
             self._pending_source = source_path_or_idx
+        self.engine.vo.reset()
 
     def toggle_play_pause(self):
         """Thread-safe play/pause toggle."""
@@ -65,6 +67,7 @@ class VideoProcessingThread(QtCore.QThread):
         """Thread-safe frame seek."""
         with QtCore.QMutexLocker(self.mutex):
             self._pending_seek = frame_idx
+        self.engine.vo.reset()
 
     def stop(self):
         """Graceful shutdown of worker thread."""
@@ -101,10 +104,12 @@ class VideoProcessingThread(QtCore.QThread):
                 self.cap = cv2.VideoCapture(new_source)
                 if self.cap.isOpened():
                     fps = self.cap.get(cv2.CAP_PROP_FPS)
-                    self.target_fps = fps if (fps and 5.0 <= fps <= 60.0) else 30.0
+                    # Play at smooth 30-60 FPS even if source video has low metadata fps (e.g. 12 fps)
+                    self.target_fps = max(30.0, float(fps)) if (fps and 5.0 <= fps <= 60.0) else 30.0
                     self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     self.current_frame_idx = 0
                     self.is_paused = False
+                    self.engine.vo.reset()
                     self.playback_state_changed.emit(True)
                 else:
                     self.source_load_failed.emit(str(new_source))
@@ -119,6 +124,7 @@ class VideoProcessingThread(QtCore.QThread):
             if new_seek >= 0 and self.cap is not None and self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, new_seek)
                 self.current_frame_idx = new_seek
+                self.engine.vo.reset()
 
             # Check capture availability
             if self.cap is None or not self.cap.isOpened():
@@ -136,6 +142,7 @@ class VideoProcessingThread(QtCore.QThread):
                 if self.loop_video and self.total_frames > 0:
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     self.current_frame_idx = 0
+                    self.engine.vo.reset()
                     continue
                 else:
                     self.is_paused = True
@@ -148,7 +155,10 @@ class VideoProcessingThread(QtCore.QThread):
             # 3. Execute panoptic perception pipeline on Apple Silicon M4
             result = self.engine.process_frame(frame, enable_panoptic=True, enable_detection=True)
 
-            self.frame_processed.emit(frame, result)
+            # Emit frame only if GUI is ready (drops backlog to keep display at maximum FPS)
+            if not self.gui_busy:
+                self.gui_busy = True
+                self.frame_processed.emit(frame, result)
             self.position_changed.emit(self.current_frame_idx, self.total_frames)
 
             # 4. Maintain target playback rate
@@ -171,6 +181,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Enable Drag and Drop from Finder
         self.setAcceptDrops(True)
+
+        # Real frame rate measurement
+        self._frame_times: List[float] = []
 
         # Perception Engine (defaults to YOLO11s)
         self.engine = PanopticPerceptionEngine(yolo_actor_weights="yolo11s.pt")
@@ -449,14 +462,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.slider_pitch = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.slider_pitch.setFixedWidth(80)
-        self.slider_pitch.setRange(1, 12) # 1° to 12°
-        self.slider_pitch.setValue(4)
+        self.slider_pitch.setRange(-12, 10) # -12° to +10°
+        self.slider_pitch.setValue(-5)
         self.slider_pitch.setStyleSheet("""
             QSlider::groove:horizontal { height: 3px; background: #1e2638; border-radius: 1px; }
             QSlider::handle:horizontal { background: #38bdf8; width: 8px; margin: -3px 0; border-radius: 4px; }
         """)
         self.slider_pitch.valueChanged.connect(self._on_pitch_changed)
         layout.addWidget(self.slider_pitch)
+
+        self.lbl_pitch_val = QtWidgets.QLabel("-5°")
+        self.lbl_pitch_val.setStyleSheet("font-size: 10px; color: #38bdf8; font-weight: 600; min-width: 26px;")
+        layout.addWidget(self.lbl_pitch_val)
 
         # ADAS Status badge
         self.lbl_status = QtWidgets.QLabel("Voie dégagée")
@@ -502,6 +519,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_pitch_changed(self, val: int):
         self.engine.geom.set_camera_parameters(pitch_deg=float(val))
+        if hasattr(self, 'lbl_pitch_val'):
+            self.lbl_pitch_val.setText(f"{val:+}°")
 
     def _on_take_snapshot(self):
         """Saves a high-resolution snapshot of both screens."""
@@ -558,9 +577,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_frame_processed(self, frame: np.ndarray, result: PerceptionResult):
         self.video_hud.update_frame(frame, result, self.engine.geom)
         self.bev_view.update_result(result)
+        self.worker.gui_busy = False
 
-        fps = 1000.0 / max(result.inference_time_ms, 1.0)
-        self.lbl_telemetry.setText(f"{fps:.0f} FPS  •  {result.inference_time_ms:.0f} ms  •  {len(result.tracks)} cibles")
+        # Measure true wall-clock playback FPS
+        now = time.time()
+        self._frame_times.append(now)
+        if len(self._frame_times) > 20:
+            self._frame_times.pop(0)
+        if len(self._frame_times) >= 2:
+            dt = self._frame_times[-1] - self._frame_times[0]
+            real_fps = (len(self._frame_times) - 1) / max(dt, 1e-4)
+        else:
+            real_fps = 30.0
+
+        self.lbl_telemetry.setText(f"{real_fps:.0f} FPS  •  {result.inference_time_ms:.0f} ms  •  {len(result.tracks)} cibles")
 
         # ADAS Status badge
         if result.fcw_alert:

@@ -73,7 +73,7 @@ class PanopticPerceptionEngine:
         yolop_weights: str = "weights/yolopv2.pt",
         yolo_actor_weights: str = "yolo11s.pt",
         cam_height: float = 1.35,
-        pitch_deg: float = 4.2,
+        pitch_deg: float = -4.5,
         fov_deg: float = 65.0
     ):
         self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -118,14 +118,14 @@ class PanopticPerceptionEngine:
             pitch_deg=pitch_deg,
             fov_deg=fov_deg
         )
-        self.tracker = CarVisionTracker(max_missed=10, metric_dist_thresh=4.8)
+        self.tracker = CarVisionTracker(max_missed=5, metric_dist_thresh=4.5)
         self.vo = VisualOdometry()
 
         # Performance tuning & adaptive cadence
         self.yolop_cadence = 3             # Run YOLOPv2 every N frames
         self.vo_cadence = 3                # Run Optical Flow every N frames
-        self.imgsz = 640                   # YOLO inference size (480..640)
-        self.actor_conf = 0.20             # Detection confidence threshold
+        self.imgsz = 576                   # YOLO inference size (fast on MPS)
+        self.actor_conf = 0.35             # Robust confidence threshold (filters false alarms)
         self.enable_pedestrian_grouping = True
 
         # Cached panoptic representations for intermediate frames
@@ -159,20 +159,20 @@ class PanopticPerceptionEngine:
         level = float(np.clip(level, 0.0, 1.0))
         if level <= 0.33:
             # High-FPS Mode
-            self.imgsz = 480
-            self.actor_conf = 0.25
+            self.imgsz = 512
+            self.actor_conf = 0.38
             self.yolop_cadence = 4
             self.vo_cadence = 4
         elif level <= 0.66:
             # Balanced Mode
             self.imgsz = 576
-            self.actor_conf = 0.20
+            self.actor_conf = 0.35
             self.yolop_cadence = 3
             self.vo_cadence = 3
         else:
             # High-Precision Mode
             self.imgsz = 640
-            self.actor_conf = 0.18
+            self.actor_conf = 0.32
             self.yolop_cadence = 2
             self.vo_cadence = 2
 
@@ -231,6 +231,9 @@ class PanopticPerceptionEngine:
             7: 'truck'
         }
 
+        fh, fw = frame.shape[:2]
+        hood_cutoff = fh * 0.91
+
         results = self.actor_model(
             frame,
             device='mps',
@@ -251,12 +254,33 @@ class PanopticPerceptionEngine:
 
                 bw = xyxy[2] - xyxy[0]
                 bh = xyxy[3] - xyxy[1]
-                if bw < 8 or bh < 8:
+                if bw < 14 or bh < 14:
+                    continue
+
+                # Anti-hallucination rule 1: Exclude vehicle hood and wipers reflection
+                if xyxy[3] > hood_cutoff:
+                    continue
+
+                # Anti-hallucination rule 2: Physical aspect ratio plausibility
+                aspect = bw / max(bh, 1.0)
+                if class_name in ('car', 'truck', 'bus') and (aspect < 0.50 or aspect > 3.2):
+                    continue
+                if class_name == 'person' and (aspect < 0.15 or aspect > 1.25):
+                    continue
+
+                # Anti-hallucination rule 3: Minimum box size in lower screen region
+                # A vehicle cannot physically be small if touching the foreground asphalt
+                if class_name in ('car', 'truck', 'bus') and (bw < 30 and bh < 30) and xyxy[3] > fh * 0.70:
                     continue
 
                 # Hybrid 3D Depth Estimation
                 X, Z, _ = self.geom.estimate_actor_3d(xyxy, class_name)
                 if X is None or Z is None or Z < 0.5 or Z > 140.0:
+                    continue
+
+                # Anti-hallucination rule 4: Enforce optical-physical consistency
+                # A car closer than 12m MUST have a prominent pixel height (>= 40px)
+                if class_name in ('car', 'truck', 'bus') and Z < 12.0 and bh < 40:
                     continue
 
                 corners_3d = self.geom.get_3d_box_corners(X, Z, class_name, yaw=0.0)
@@ -378,19 +402,19 @@ class PanopticPerceptionEngine:
         Calculates vanishing point where left and right lane boundaries converge.
         """
         h, w = lane_mask.shape
-        roi = lane_mask[int(h * 0.45):, :]
-        v_offset = int(h * 0.45)
+        roi = lane_mask[int(h * 0.40):, :]
+        v_offset = int(h * 0.40)
 
         mid_x = w // 2
         left_pts = np.argwhere(roi[:, :mid_x] > 0)
         right_pts = np.argwhere(roi[:, mid_x:] > 0)
 
-        if len(left_pts) < 40 or len(right_pts) < 40:
+        if len(left_pts) < 25 or len(right_pts) < 25:
             return None
 
         # Sample points to speed up fitLine
-        sub_l = left_pts[::10]
-        sub_r = right_pts[::10]
+        sub_l = left_pts[::8]
+        sub_r = right_pts[::8]
 
         left_line = cv2.fitLine(np.column_stack((sub_l[:, 1], sub_l[:, 0] + v_offset)), cv2.DIST_L2, 0, 0.01, 0.01)
         right_line = cv2.fitLine(np.column_stack((sub_r[:, 1] + mid_x, sub_r[:, 0] + v_offset)), cv2.DIST_L2, 0, 0.01, 0.01)
@@ -406,7 +430,7 @@ class PanopticPerceptionEngine:
         vp_x = x1 + t * vx1
         vp_y = y1 + t * vy1
 
-        if 0 < vp_x < w and 0.2 * h < vp_y < 0.65 * h:
+        if 0 < vp_x < w and 0.25 * h < vp_y < 0.72 * h:
             return float(vp_x), float(vp_y)
 
         return None
